@@ -12,6 +12,7 @@ from xarray_einstats.stats import logsumexp
 from arviz_stats.utils import get_log_likelihood
 
 __all__ = [
+    "_split_moment_match",
     "_get_r_eff",
     "_plpd_approx",
     "_diff_srs_estimator",
@@ -53,18 +54,224 @@ UpdateSubsampleData = namedtuple(
 )
 
 
-def _get_r_eff(data, n_samples):
-    if not hasattr(data, "posterior"):
-        raise TypeError("Must be able to extract a posterior group from data.")
-    posterior = data.posterior
-    n_chains = len(posterior.chain)
-    if n_chains == 1:
-        reff = 1.0
-    else:
-        ess_p = posterior.azstats.ess(method="mean")
-        # this mean is over all data variables
-        reff = np.hstack([ess_p[v].values.flatten() for v in ess_p.data_vars]).mean() / n_samples
-    return reff
+def _split_moment_match(
+    upars,
+    cov,
+    total_shift,
+    total_scaling,
+    total_mapping,
+    i,
+    reff,
+    log_prob_upars_fn,
+    log_lik_i_upars_fn,
+):
+    r"""Split moment matching importance sampling for PSIS-LOO-CV.
+
+    Applies affine transformations based on the total moment matching transformation
+    to half of the posterior draws, leaving the other half unchanged. These complementary
+    approximations to the leave-one-out posterior are then combined using multiple
+    importance sampling.
+
+    Based on the implicit adaptive importance sampling algorithm of [1]_ and the
+    PSIS-LOO-CV method of [2]_ and [3]_.
+
+    Parameters
+    ----------
+    upars : DataArray
+        A DataArray representing the posterior draws of the model parameters in the
+        unconstrained space. Must contain the dimensions ``chain`` and ``draw`` and a final
+        dimension representing the different unconstrained parameters.
+    cov : bool
+        Whether to match the full covariance matrix of the samples (True) or just the
+        marginal variances (False). Using the full covariance is more computationally
+        expensive.
+    total_shift : ndarray
+        Vector containing the total shift (translation) applied to the parameters. Shape should
+        match the parameter dimension of ``upars``.
+    total_scaling : ndarray
+        Vector containing the total scaling factors for the marginal variances. Shape should
+        match the parameter dimension of ``upars``.
+    total_mapping : ndarray
+        Square matrix representing the linear transformation applied to the covariance matrix.
+        Shape should be (d, d) where d is the parameter dimension.
+    i : int
+        Index of the specific observation to be left out for computing leave-one-out
+        likelihood.
+    reff : float, optional
+        Relative MCMC efficiency, ``ess / n`` i.e. number of effective samples divided by the number
+        of actual samples. Computed from trace by default.
+    log_prob_upars_fn : Callable[[ndarray], ndarray]
+        A function that computes the log probability density of the *full posterior*
+        distribution evaluated at given unconstrained parameter values.
+
+        - **Input:** An ndarray of parameter samples with shape (n_samples, n_params).
+        - **Output:** An ndarray of log probability values with shape (n_samples,).
+    log_lik_i_upars_fn : Callable[[ndarray, int], ndarray]
+        A function that computes the log-likelihood of the *left-out observation* `i`
+        evaluated at given unconstrained parameter values.
+
+        - **Input:** An ndarray of parameter samples with shape (n_samples, n_params) and
+          the integer index `i` of the left-out observation.
+        - **Output:** An ndarray of log-likelihood values for observation `i`
+          with shape (n_samples,).
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        - lwi: Updated log importance weights for each sample
+        - lwfi: Updated log importance weights for full distribution
+        - log_liki: Updated log likelihood values for the specific observation
+        - reff: Relative MCMC efficiency
+
+    References
+    ----------
+
+    .. [1] Paananen, T., Piironen, J., Buerkner, P.-C., Vehtari, A. (2021). *Implicitly Adaptive
+        Importance Sampling*. Statistics and Computing. 31(2) (2021)
+        https://doi.org/10.1007/s11222-020-09982-2
+        arXiv preprint https://arxiv.org/abs/1906.08850.
+    .. [2] Vehtari et al. *Practical Bayesian model evaluation using leave-one-out cross-validation
+        and WAIC*. Statistics and Computing. 27(5) (2017) https://doi.org/10.1007/s11222-016-9696-4
+        arXiv preprint https://arxiv.org/abs/1507.04544.
+    .. [3] Vehtari et al. *Pareto Smoothed Importance Sampling*.
+        Journal of Machine Learning Research, 25(72) (2024) https://jmlr.org/papers/v25/19-556.html
+        arXiv preprint https://arxiv.org/abs/1507.02646
+    """
+    if not isinstance(upars, xr.DataArray):
+        raise TypeError("upars must be a DataArray.")
+
+    sample_dims = ["chain", "draw"]
+    param_dim = upars.dims[-1]
+
+    if not all(dim in upars.dims for dim in sample_dims):
+        raise ValueError(
+            f"Required sample dimensions {sample_dims} not found in upars dimensions {upars.dims}"
+        )
+
+    dim = upars.sizes[param_dim]
+    upars_stacked = upars.stack(__sample__=sample_dims)
+    upars_values = upars_stacked.transpose("__sample__", param_dim).data
+
+    n_samples = upars_values.shape[0]
+
+    original_coords = {d: upars.coords[d] for d in sample_dims}
+    original_dims_shape = tuple(upars.sizes[d] for d in sample_dims)
+
+    n_samples_half = n_samples // 2
+    mean_original = np.mean(upars_values, axis=0) if dim > 0 else np.array([])
+
+    if total_shift is None or total_shift.size == 0:
+        total_shift = np.zeros(dim)
+    if total_scaling is None or total_scaling.size == 0:
+        total_scaling = np.ones(dim)
+    if total_mapping is None or total_mapping.size == 0:
+        total_mapping = np.eye(dim)
+
+    # Forward transformation
+    upars_trans = upars_values - mean_original[None, :]
+    upars_trans = upars_trans * total_scaling[None, :]
+    if cov:
+        upars_trans = upars_trans @ total_mapping.T
+    upars_trans = upars_trans + (total_shift + mean_original)[None, :]
+
+    # Inverse transformation
+    upars_trans_inv = upars_values - mean_original[None, :]
+
+    if cov:
+        upars_trans_inv = upars_trans_inv @ np.linalg.inv(total_mapping).T
+
+    upars_trans_inv = upars_trans_inv / total_scaling[None, :]
+    upars_trans_inv = upars_trans_inv + (mean_original - total_shift)[None, :]
+
+    # Split transformations - first half gets forward transform
+    upars_trans_half = upars_values.copy()
+    upars_trans_half[:n_samples_half] = upars_trans[:n_samples_half]
+
+    # Second half gets inverse transform
+    upars_trans_half_inv = upars_values.copy()
+    upars_trans_half_inv[n_samples_half:] = upars_trans_inv[n_samples_half:]
+
+    try:
+        log_prob_half_trans_np = log_prob_upars_fn(upars_trans_half)
+        log_prob_half_trans_inv_np = log_prob_upars_fn(upars_trans_half_inv)
+    except Exception as e:
+        raise ValueError(
+            f"Could not compute log probabilities for transformed parameters: {e}"
+        ) from e
+
+    try:
+        log_liki_half_np = log_lik_i_upars_fn(upars_trans_half, i)
+
+        if hasattr(log_liki_half_np, "flatten"):
+            log_liki_half_np = log_liki_half_np.flatten()
+        if log_liki_half_np.shape[0] != n_samples:
+            raise ValueError(
+                f"log_lik_i_upars_fn output length ({log_liki_half_np.shape[0]}) "
+                f"does not match number of samples ({n_samples})"
+            )
+    except Exception as e:
+        raise ValueError(f"Could not compute log likelihood for observation {i}: {e}") from e
+
+    # Jacobian adjustment
+    if dim > 0:
+        log_prob_half_trans_inv_np = (
+            log_prob_half_trans_inv_np
+            - np.sum(np.log(total_scaling))
+            - np.log(np.abs(np.linalg.det(total_mapping)))
+        )
+
+    # Multiple importance sampling (2 components essentially)
+    use_forward_log_prob = log_prob_half_trans_np > log_prob_half_trans_inv_np
+    raw_log_weights_half = -log_liki_half_np + log_prob_half_trans_np
+
+    raw_log_weights_half[use_forward_log_prob] = raw_log_weights_half[use_forward_log_prob] - (
+        log_prob_half_trans_np[use_forward_log_prob]
+        + np.log1p(
+            np.exp(
+                log_prob_half_trans_inv_np[use_forward_log_prob]
+                - log_prob_half_trans_np[use_forward_log_prob]
+            )
+        )
+    )
+
+    raw_log_weights_half[~use_forward_log_prob] = raw_log_weights_half[~use_forward_log_prob] - (
+        log_prob_half_trans_inv_np[~use_forward_log_prob]
+        + np.log1p(
+            np.exp(
+                log_prob_half_trans_np[~use_forward_log_prob]
+                - log_prob_half_trans_inv_np[~use_forward_log_prob]
+            )
+        )
+    )
+
+    raw_log_weights_half[np.isnan(raw_log_weights_half)] = -np.inf
+    is_pos_inf = np.isposinf(raw_log_weights_half)
+    raw_log_weights_half[is_pos_inf] = -np.inf  # type: ignore
+
+    lwi_half_reshaped_np = raw_log_weights_half.reshape(original_dims_shape)
+    lwi_half_da = xr.DataArray(lwi_half_reshaped_np, coords=original_coords, dims=sample_dims)
+
+    # PSIS-LOO-CV weights
+    lwi_psis_da, _ = lwi_half_da.azstats.psislw(r_eff=reff, dims=sample_dims)
+
+    log_liki_half_reshaped_np = log_liki_half_np.reshape(original_dims_shape)
+    log_liki_half_da = xr.DataArray(
+        log_liki_half_reshaped_np, coords=original_coords, dims=sample_dims
+    )
+
+    lr_da = lwi_psis_da + log_liki_half_da
+    lr_da = xr.where(np.isnan(lr_da) | (np.isinf(lr_da) & (lr_da > 0)), -np.inf, lr_da)
+
+    lwfi_psis_da, _ = lr_da.azstats.psislw(r_eff=reff, dims=sample_dims)
+
+    return {
+        "lwi": lwi_psis_da,
+        "lwfi": lwfi_psis_da,
+        "log_liki": log_liki_half_da,
+        "reff": reff,
+    }
 
 
 def _plpd_approx(
@@ -295,6 +502,20 @@ def _generate_subsample_indices(n_data_points, observations, seed):
     else:
         raise TypeError("observations must be an integer or a numpy array of integers.")
     return indices, subsample_size
+
+
+def _get_r_eff(data, n_samples):
+    if not hasattr(data, "posterior"):
+        raise TypeError("Must be able to extract a posterior group from data.")
+    posterior = data.posterior
+    n_chains = len(posterior.chain)
+    if n_chains == 1:
+        reff = 1.0
+    else:
+        ess_p = posterior.azstats.ess(method="mean")
+        # this mean is over all data variables
+        reff = np.hstack([ess_p[v].values.flatten() for v in ess_p.data_vars]).mean() / n_samples
+    return reff
 
 
 def _prepare_loo_inputs(data, var_name, thin_factor=None):

@@ -23,6 +23,7 @@ from arviz_stats.helper_loo import (
     _prepare_update_subsample,
     _select_obs_by_coords,
     _select_obs_by_indices,
+    _split_moment_match,
     _srs_estimator,
     _warn_pareto_k,
     _warn_pointwise_loo,
@@ -435,3 +436,168 @@ def test_prepare_update_subsample(centered_eight, log_lik_fn, method):
     assert result.lpd_approx_all.shape == (n_data_points,)
     assert not np.any(np.isin(result.new_indices, old_indices))
     assert len(np.intersect1d(result.new_indices, old_indices)) == 0
+
+
+@pytest.fixture(scope="module")
+def mock_log_prob_upars_fn():
+    def _mock_fn(upars):
+        return np.sum(upars, axis=1)
+
+    return _mock_fn
+
+
+@pytest.fixture(scope="module")
+def mock_log_lik_i_upars_fn():
+    def _mock_fn(upars, i):  # pylint: disable=unused-argument
+        total_samples = upars.shape[0]
+        rng = np.random.default_rng(i + 42)
+        return -float(i + 1) + rng.normal(0, 0.01, size=total_samples)
+
+    return _mock_fn
+
+
+@pytest.mark.parametrize("cov_val", [True, False])
+@pytest.mark.parametrize(
+    "transform_params",
+    [
+        (None, None, None),
+        (np.array([0.1, 0.2, 0.3]), np.array([1.1, 1.2, 1.3]), np.eye(3) * 1.1),
+        (np.array([]), np.array([]), np.empty((0, 0))),
+    ],
+)
+def test_split_moment_match_general(
+    cov_val,
+    transform_params,
+    mock_log_prob_upars_fn,
+    mock_log_lik_i_upars_fn,
+):
+    dims = ("chain", "draw", "param")
+    shapes = (2, 1000, 3)
+    n_params = shapes[-1]
+
+    assert n_params == 3, f"Unexpected param dimension size: {n_params}"
+
+    current_total_shift, current_total_scaling, current_total_mapping = transform_params
+
+    coords = {}
+    for dim_name, dim_shape in zip(dims[:-1], shapes[:-1]):
+        coords[dim_name] = np.arange(dim_shape)
+    coords[dims[-1]] = [f"p_{k}" for k in range(shapes[-1])]
+
+    upars_data = np.random.randn(*shapes)
+    upars_da = xr.DataArray(upars_data, dims=dims, coords=coords)
+
+    reff_val = 0.8
+    obs_idx = 1
+
+    result = _split_moment_match(
+        upars=upars_da,
+        cov=cov_val,
+        total_shift=current_total_shift,
+        total_scaling=current_total_scaling,
+        total_mapping=current_total_mapping,
+        i=obs_idx,
+        reff=reff_val,
+        log_prob_upars_fn=mock_log_prob_upars_fn,
+        log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
+    )
+
+    assert isinstance(result, dict)
+    assert "lwi" in result
+    assert "lwfi" in result
+    assert "log_liki" in result
+    assert "reff" in result
+
+    expected_sample_dims = ("chain", "draw")
+    expected_sample_coords = {d: upars_da.coords[d] for d in expected_sample_dims}
+
+    for key in ["lwi", "lwfi", "log_liki"]:
+        assert isinstance(result[key], xr.DataArray)
+        assert result[key].dims == expected_sample_dims
+        for _, d_name in enumerate(expected_sample_dims):
+            assert_allclose(
+                result[key].coords[d_name].values, expected_sample_coords[d_name].values
+            )
+        assert np.all(np.isfinite(result[key].values) | (result[key].values == -np.inf))
+
+    assert result["reff"] == reff_val
+
+    if n_params > 0:
+        assert result["log_liki"].dims == expected_sample_dims
+        assert result["log_liki"].shape == tuple(upars_da.sizes[d] for d in expected_sample_dims)
+
+        for dim in expected_sample_dims:
+            assert_allclose(result["log_liki"].coords[dim].values, upars_da.coords[dim].values)
+
+
+def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
+    with pytest.raises(TypeError, match="upars must be a DataArray"):
+        _split_moment_match(
+            upars=np.random.randn(10, 2),
+            cov=False,
+            total_shift=None,
+            total_scaling=None,
+            total_mapping=None,
+            i=0,
+            reff=1.0,
+            log_prob_upars_fn=mock_log_prob_upars_fn,
+            log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
+        )
+
+    upars_no_sample_dim = xr.DataArray(
+        np.random.randn(3), dims=["param"], coords={"param": ["a", "b", "c"]}
+    )
+    with pytest.raises(ValueError, match="Required sample dimensions .* not found"):
+        _split_moment_match(
+            upars=upars_no_sample_dim,
+            cov=False,
+            total_shift=None,
+            total_scaling=None,
+            total_mapping=None,
+            i=0,
+            reff=1.0,
+            log_prob_upars_fn=mock_log_prob_upars_fn,
+            log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
+        )
+
+    upars_for_lik_len_test = xr.DataArray(
+        np.random.randn(2, 5, 2),
+        dims=["chain", "draw", "param"],
+        coords={"chain": np.arange(2), "draw": np.arange(5), "param": ["p1", "p2"]},
+    )
+
+    def bad_log_lik_fn(upars_np, i):  # pylint: disable=unused-argument
+        return np.full(upars_np.shape[0] - 1, -1.0)
+
+    with pytest.raises(ValueError, match="log_lik_i_upars_fn output length"):
+        _split_moment_match(
+            upars=upars_for_lik_len_test,
+            cov=False,
+            total_shift=None,
+            total_scaling=None,
+            total_mapping=None,
+            i=0,
+            reff=1.0,
+            log_prob_upars_fn=mock_log_prob_upars_fn,
+            log_lik_i_upars_fn=bad_log_lik_fn,
+        )
+
+    upars_for_inv_error = xr.DataArray(
+        np.random.randn(2, 10, 2),
+        dims=("chain", "draw", "param"),
+        coords={"chain": range(2), "draw": range(10), "param": ["p1", "p2"]},
+    )
+
+    non_invertible_map = np.array([[1.0, 1.0], [1.0, 1.0]])
+    with pytest.raises(np.linalg.LinAlgError):
+        _split_moment_match(
+            upars=upars_for_inv_error,
+            cov=True,
+            total_shift=None,
+            total_scaling=None,
+            total_mapping=non_invertible_map,
+            i=0,
+            reff=1.0,
+            log_prob_upars_fn=mock_log_prob_upars_fn,
+            log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
+        )
