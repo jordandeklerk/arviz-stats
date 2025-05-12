@@ -13,11 +13,11 @@ from arviz_stats.utils import get_log_likelihood
 
 __all__ = [
     "_split_moment_match",
-    "_get_r_eff",
     "_plpd_approx",
     "_diff_srs_estimator",
     "_srs_estimator",
     "_generate_subsample_indices",
+    "_get_r_eff",
     "_prepare_loo_inputs",
     "_extract_loo_data",
     "_check_log_density",
@@ -53,6 +53,11 @@ UpdateSubsampleData = namedtuple(
     ],
 )
 
+SplitMomentMatch = namedtuple(
+    "SplitMomentMatch",
+    ["lwi", "lwfi", "log_liki", "reff"],
+)
+
 
 def _split_moment_match(
     upars,
@@ -68,9 +73,8 @@ def _split_moment_match(
     r"""Split moment matching importance sampling for PSIS-LOO-CV.
 
     Applies affine transformations based on the total moment matching transformation
-    to half of the posterior draws, leaving the other half unchanged. These complementary
-    approximations to the leave-one-out posterior are then combined using multiple
-    importance sampling.
+    to half of the posterior draws, leaving the other half unchanged. These approximations
+    to the leave-one-out posterior are then combined using multiple importance sampling.
 
     Based on the implicit adaptive importance sampling algorithm of [1]_ and the
     PSIS-LOO-CV method of [2]_ and [3]_.
@@ -117,8 +121,8 @@ def _split_moment_match(
 
     Returns
     -------
-    dict
-        Dictionary containing:
+    SplitMomentMatch
+        A namedtuple containing:
 
         - lwi: Updated log importance weights for each sample
         - lwfi: Updated log importance weights for full distribution
@@ -266,12 +270,12 @@ def _split_moment_match(
 
     lwfi_psis_da, _ = lr_da.azstats.psislw(r_eff=reff, dims=sample_dims)
 
-    return {
-        "lwi": lwi_psis_da,
-        "lwfi": lwfi_psis_da,
-        "log_liki": log_liki_half_da,
-        "reff": reff,
-    }
+    return SplitMomentMatch(
+        lwi=lwi_psis_da,
+        lwfi=lwfi_psis_da,
+        log_liki=log_liki_half_da,
+        reff=reff,
+    )
 
 
 def _plpd_approx(

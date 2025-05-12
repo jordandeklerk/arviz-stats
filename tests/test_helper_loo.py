@@ -502,32 +502,29 @@ def test_split_moment_match_general(
         log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
     )
 
-    assert isinstance(result, dict)
-    assert "lwi" in result
-    assert "lwfi" in result
-    assert "log_liki" in result
-    assert "reff" in result
+    from arviz_stats.helper_loo import SplitMomentMatch
+
+    assert isinstance(result, SplitMomentMatch)
 
     expected_sample_dims = ("chain", "draw")
     expected_sample_coords = {d: upars_da.coords[d] for d in expected_sample_dims}
 
-    for key in ["lwi", "lwfi", "log_liki"]:
-        assert isinstance(result[key], xr.DataArray)
-        assert result[key].dims == expected_sample_dims
+    for attr_name in ["lwi", "lwfi", "log_liki"]:
+        attr_value = getattr(result, attr_name)
+        assert isinstance(attr_value, xr.DataArray)
+        assert attr_value.dims == expected_sample_dims
         for _, d_name in enumerate(expected_sample_dims):
-            assert_allclose(
-                result[key].coords[d_name].values, expected_sample_coords[d_name].values
-            )
-        assert np.all(np.isfinite(result[key].values) | (result[key].values == -np.inf))
+            assert_allclose(attr_value.coords[d_name].values, expected_sample_coords[d_name].values)
+        assert np.all(np.isfinite(attr_value.values) | (attr_value.values == -np.inf))
 
-    assert result["reff"] == reff_val
+    assert result.reff == reff_val
 
     if n_params > 0:
-        assert result["log_liki"].dims == expected_sample_dims
-        assert result["log_liki"].shape == tuple(upars_da.sizes[d] for d in expected_sample_dims)
+        assert result.log_liki.dims == expected_sample_dims
+        assert result.log_liki.shape == tuple(upars_da.sizes[d] for d in expected_sample_dims)
 
         for dim in expected_sample_dims:
-            assert_allclose(result["log_liki"].coords[dim].values, upars_da.coords[dim].values)
+            assert_allclose(result.log_liki.coords[dim].values, upars_da.coords[dim].values)
 
 
 def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
