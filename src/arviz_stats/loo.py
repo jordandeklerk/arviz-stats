@@ -1214,21 +1214,21 @@ def loo_moment_match(
         An existing ELPDData object from a previous `loo` result. It must contain
         pointwise Pareto k values (`pointwise=True` must have been used).
     upars : DataArray
-        A :class:`~xarray.DataArray` of the posterior draws transformed to the
-        unconstrained parameter space. It must have "chain" and "draw" dimensions.
-        If it has a third dimension, this dimension represents the different
-        unconstrained parameters. If it only has "chain" and "draw" dimensions, it
-        is assumed to represent a single unconstrained parameter and will be expanded internally.
+        Posterior draws transformed to the unconstrained parameter space. It must have
+        "chain" and "draw" dimensions. If it has a third dimension, this dimension
+        represents the different unconstrained parameters. If it only has "chain" and
+        "draw" dimensions, it is assumed to represent a single unconstrained parameter and
+        will be expanded internally.
     log_prob_upars_fn : Callable[[DataArray], DataArray]
         A function that takes the unconstrained parameter draws and returns a
         :class:`~xarray.DataArray` containing the log probability density of the full posterior
         distribution evaluated at each unconstrained parameter draw. The returned DataArray must
-        have dimensions "chain", "draw".
+        have dimensions `chain`, `draw`.
     log_lik_i_upars_fn : Callable[[DataArray, int], DataArray]
         A function that takes the unconstrained parameter draws and the integer index `i`
         of the left-out observation. It should return a :class:`~xarray.DataArray` containing the
         log-likelihood of the left-out observation `i` evaluated at each unconstrained parameter
-        draw. The returned DataArray must have dimensions "chain", "draw".
+        draw. The returned DataArray must have dimensions `chain`, `draw`.
     max_iters : int, default 30
         Maximum number of moment matching iterations for each problematic observation.
     k_threshold : float, optional
@@ -1241,9 +1241,9 @@ def loo_moment_match(
         If True, match the covariance structure during the transformation, in addition
         to the mean and marginal variances. Ignored if ``split=False``.
     pointwise: bool, optional
-        If True the pointwise predictive accuracy will be returned. Defaults to
-        ``rcParams["stats.ic_pointwise"]``. Note: Moment matching always requires
-        pointwise data from `loo_orig`. This argument controls whether the *returned*
+        If True, the pointwise predictive accuracy will be returned. Defaults to
+        ``rcParams["stats.ic_pointwise"]``. Moment matching always requires
+        pointwise data from `loo_orig`. This argument controls whether the returned
         object includes pointwise data.
     var_name : str, optional
         The name of the variable in log_likelihood groups storing the pointwise log
@@ -1311,14 +1311,14 @@ def loo_moment_match(
 
     .. math::
         \mathbf{LL}^T = \mathbf{\Sigma} = \frac{1}{S} \sum_{s=1}^S (\mathbf{\theta^{(s)}} -
-        \bar{\theta}) (\mathbf{\theta^{(s)}} - \bar{\theta})^T,
+        \bar{\theta}) (\mathbf{\theta^{(s)}} - \bar{\theta})^T
 
     and
 
     .. math::
         \mathbf{L}_w \mathbf{L}_w^T = \mathbf{\Sigma}_w = \frac{\frac{1}{S} \sum_{s=1}^S
         w^{(s)} (\mathbf{\theta^{(s)}} - \bar{\theta}_w) (\mathbf{\theta^{(s)}} -
-        \bar{\theta}_w)^T}{\sum_{s=1}^S w^{(s)}},
+        \bar{\theta}_w)^T}{\sum_{s=1}^S w^{(s)}}.
 
     We iterate on :math:`T_1` repeatedly and move onto :math:`T_2` and :math:`T_3` only
     if :math:`T_1` fails to yield a Pareto-k statistic below the threshold.
@@ -1376,6 +1376,7 @@ def loo_moment_match(
     obs_dims = loo_inputs.obs_dims
     n_samples = loo_inputs.n_samples
     var_name = loo_inputs.var_name
+    n_params = upars.sizes[param_dim_name]
 
     if reff is None:
         reff = _get_r_eff(data, n_samples)
@@ -1427,98 +1428,7 @@ def loo_moment_match(
         iterind = 1
         transformations_applied = False
 
-        while iterind <= max_iters and ki > k_threshold:
-            improved_in_iteration = False
-
-            # Mean Shift
-            shift_res = _shift(upars_i, lwi)
-            try:
-                log_prob_shifted = log_prob_upars_fn(shift_res.upars)
-                log_liki_shifted = log_lik_i_upars_fn(shift_res.upars, i)
-                weights_k_res = _recalculate_weights_k(
-                    log_liki_shifted, log_prob_shifted, orig_log_prob, reff_i, sample_dims
-                )
-            except RuntimeError as e:
-                warnings.warn(
-                    f"Error during mean shift calculation for observation {i}: {e}. "
-                    "Skipping transformation step.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                break
-
-            if weights_k_res.ki < ki:
-                ki = weights_k_res.ki
-                lwi = weights_k_res.lwi
-                log_liki = weights_k_res.log_liki
-                upars_i = shift_res.upars
-                total_shift += shift_res.shift
-                improved_in_iteration = True
-                transformations_applied = True
-
-            # Scale Shift
-            scale_res = _shift_and_scale(upars_i, lwi)
-            try:
-                log_prob_scaled = log_prob_upars_fn(scale_res.upars)
-                log_liki_scaled = log_lik_i_upars_fn(scale_res.upars, i)
-                weights_k_res_scale = _recalculate_weights_k(
-                    log_liki_scaled, log_prob_scaled, orig_log_prob, reff_i, sample_dims
-                )
-            except RuntimeError as e:
-                warnings.warn(
-                    f"Error during scale shift calculation for observation {i}: {e}. "
-                    "Skipping transformation step.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                if improved_in_iteration:
-                    continue
-                break
-
-            if weights_k_res_scale.ki < ki:
-                ki = weights_k_res_scale.ki
-                lwi = weights_k_res_scale.lwi
-                log_liki = weights_k_res_scale.log_liki
-                upars_i = scale_res.upars
-                total_shift = scale_res.shift + total_shift * scale_res.scaling
-                total_scaling *= scale_res.scaling
-                improved_in_iteration = True
-                transformations_applied = True
-
-            # Covariance Shift
-            if cov:
-                cov_res = _shift_and_cov(upars_i, lwi)
-                try:
-                    log_prob_cov = log_prob_upars_fn(cov_res.upars)
-                    log_liki_cov = log_lik_i_upars_fn(cov_res.upars, i)
-                    weights_k_res_cov = _recalculate_weights_k(
-                        log_liki_cov, log_prob_cov, orig_log_prob, reff_i, sample_dims
-                    )
-                except RuntimeError as e:
-                    warnings.warn(
-                        f"Error during covariance shift calculation for observation {i}: {e}. "
-                        "Skipping transformation step.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    if improved_in_iteration:
-                        continue
-                    break
-
-                if weights_k_res_cov.ki < ki:
-                    ki = weights_k_res_cov.ki
-                    lwi = weights_k_res_cov.lwi
-                    log_liki = weights_k_res_cov.log_liki
-                    upars_i = cov_res.upars
-                    total_shift = cov_res.shift + total_shift @ cov_res.mapping.T
-                    total_mapping = cov_res.mapping @ total_mapping
-                    improved_in_iteration = True
-                    transformations_applied = True
-
-            if not improved_in_iteration:
-                break  # Stop iterations if no improvement in this round
-
-            iterind += 1
+        while ki > k_threshold:
             if iterind > max_iters:
                 warnings.warn(
                     f"Maximum number of moment matching iterations ({max_iters}) reached "
@@ -1526,6 +1436,102 @@ def loo_moment_match(
                     UserWarning,
                     stacklevel=2,
                 )
+                break
+
+            # Try Mean Shift
+            try:
+                shift_res = _shift(upars_i, lwi)
+                log_prob_shifted = log_prob_upars_fn(shift_res.upars)
+                log_liki_shifted = log_lik_i_upars_fn(shift_res.upars, i)
+                weights_k_res = _recalculate_weights_k(
+                    log_liki_shifted, log_prob_shifted, orig_log_prob, reff_i, sample_dims
+                )
+                if weights_k_res.ki < ki:
+                    ki = weights_k_res.ki
+                    lwi = weights_k_res.lwi
+                    log_liki = weights_k_res.log_liki
+                    upars_i = shift_res.upars
+                    total_shift += shift_res.shift
+                    transformations_applied = True
+                    iterind += 1
+                    continue  # Restart, try mean shift again
+
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error during mean shift calculation for observation {i}: {e}. "
+                    "Stopping moment matching for this observation.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
+
+            # Try Scale Shift (only if mean shift didn't improve)
+            try:
+                scale_res = _shift_and_scale(upars_i, lwi)
+                log_prob_scaled = log_prob_upars_fn(scale_res.upars)
+                log_liki_scaled = log_lik_i_upars_fn(scale_res.upars, i)
+                weights_k_res_scale = _recalculate_weights_k(
+                    log_liki_scaled, log_prob_scaled, orig_log_prob, reff_i, sample_dims
+                )
+                if weights_k_res_scale.ki < ki:
+                    ki = weights_k_res_scale.ki
+                    lwi = weights_k_res_scale.lwi
+                    log_liki = weights_k_res_scale.log_liki
+                    upars_i = scale_res.upars
+                    total_shift = scale_res.shift + total_shift * scale_res.scaling
+                    total_scaling *= scale_res.scaling
+                    transformations_applied = True
+                    iterind += 1
+                    continue  # Restart, try mean shift again
+
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error during scale shift calculation for observation {i}: {e}. "
+                    "Stopping moment matching for this observation.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
+
+            # Try Covariance Shift (only if mean and scale shift didn't improve, cov=True,
+            # and S >= 10 * npars)
+            if cov and n_samples >= 10 * n_params:
+                try:
+                    cov_res = _shift_and_cov(upars_i, lwi)
+                    log_prob_cov = log_prob_upars_fn(cov_res.upars)
+                    log_liki_cov = log_lik_i_upars_fn(cov_res.upars, i)
+                    weights_k_res_cov = _recalculate_weights_k(
+                        log_liki_cov, log_prob_cov, orig_log_prob, reff_i, sample_dims
+                    )
+                    if weights_k_res_cov.ki < ki:
+                        ki = weights_k_res_cov.ki
+                        lwi = weights_k_res_cov.lwi
+                        log_liki = weights_k_res_cov.log_liki
+                        upars_i = cov_res.upars
+                        total_shift = cov_res.shift + total_shift @ cov_res.mapping.T
+                        total_mapping = cov_res.mapping @ total_mapping
+                        transformations_applied = True
+                        iterind += 1
+                        continue  # Restart, try mean shift again
+
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"Error during covariance shift calculation for observation {i}: {e}. "
+                        "Stopping moment matching for this observation.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    break
+            else:
+                warnings.warn(
+                    f"Not enough samples ({n_samples}) to perform covariance shift "
+                    f"for observation {i}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            # If none of the transformations in this pass improved ki, break.
+            break
 
         final_log_liki = log_liki
         final_lwi = lwi
