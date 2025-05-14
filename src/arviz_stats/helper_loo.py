@@ -28,13 +28,19 @@ __all__ = [
     "_select_obs_by_indices",
     "_select_obs_by_coords",
     "_prepare_full_arrays",
+    "_shift",
+    "_shift_and_scale",
+    "_shift_and_cov",
+    "_recalculate_weights_k",
+    "_update_loo_data_i",
+    "_get_log_likelihood_i",
 ]
-
 
 LooInputs = namedtuple(
     "LooInputs",
     ["log_likelihood", "var_name", "sample_dims", "obs_dims", "n_samples", "n_data_points"],
 )
+
 SubsampleData = namedtuple(
     "SubsampleData",
     ["log_likelihood_sample", "lpd_approx_sample", "lpd_approx_all", "indices", "subsample_size"],
@@ -53,9 +59,12 @@ UpdateSubsampleData = namedtuple(
     ],
 )
 
-SplitMomentMatch = namedtuple(
-    "SplitMomentMatch",
-    ["lwi", "lwfi", "log_liki", "reff"],
+SplitMomentMatch = namedtuple("SplitMomentMatch", ["lwi", "lwfi", "log_liki", "reff"])
+ShiftResult = namedtuple("ShiftResult", ["upars", "shift"])
+ShiftAndScaleResult = namedtuple("ShiftAndScaleResult", ["upars", "shift", "scaling"])
+ShiftAndCovResult = namedtuple("ShiftAndCovResult", ["upars", "shift", "mapping"])
+RecalculateWeightsResult = namedtuple(
+    "RecalculateWeightsResult", ["lwi", "lwfi", "ki", "kfi", "log_liki"]
 )
 
 
@@ -101,23 +110,17 @@ def _split_moment_match(
     i : int
         Index of the specific observation to be left out for computing leave-one-out
         likelihood.
-    reff : float, optional
+    reff : float
         Relative MCMC efficiency, ``ess / n`` i.e. number of effective samples divided by the number
-        of actual samples. Computed from trace by default.
-    log_prob_upars_fn : Callable[[ndarray], ndarray]
+        of actual samples.
+    log_prob_upars_fn : Callable[[DataArray], DataArray]
         A function that computes the log probability density of the *full posterior*
-        distribution evaluated at given unconstrained parameter values.
-
-        - **Input:** An ndarray of parameter samples with shape (n_samples, n_params).
-        - **Output:** An ndarray of log probability values with shape (n_samples,).
-    log_lik_i_upars_fn : Callable[[ndarray, int], ndarray]
+        distribution evaluated at given unconstrained parameter values (as a DataArray).
+        Input and Output must have dimensions "chain" and "draw".
+    log_lik_i_upars_fn : Callable[[DataArray, int], DataArray]
         A function that computes the log-likelihood of the *left-out observation* `i`
-        evaluated at given unconstrained parameter values.
-
-        - **Input:** An ndarray of parameter samples with shape (n_samples, n_params) and
-          the integer index `i` of the left-out observation.
-        - **Output:** An ndarray of log-likelihood values for observation `i`
-          with shape (n_samples,).
+        evaluated at given unconstrained parameter values (as a DataArray).
+        Input and Output must have dimensions "chain" and "draw".
 
     Returns
     -------
@@ -147,7 +150,11 @@ def _split_moment_match(
         raise TypeError("upars must be a DataArray.")
 
     sample_dims = ["chain", "draw"]
-    param_dim = upars.dims[-1]
+    param_dim_list = [dim for dim in upars.dims if dim not in sample_dims]
+
+    if len(param_dim_list) != 1:
+        raise ValueError("upars must have exactly one dimension besides chain and draw.")
+    param_dim = param_dim_list[0]
 
     if not all(dim in upars.dims for dim in sample_dims):
         raise ValueError(
@@ -155,16 +162,11 @@ def _split_moment_match(
         )
 
     dim = upars.sizes[param_dim]
-    upars_stacked = upars.stack(__sample__=sample_dims)
-    upars_values = upars_stacked.transpose("__sample__", param_dim).data
-
-    n_samples = upars_values.shape[0]
-
-    original_coords = {d: upars.coords[d] for d in sample_dims}
-    original_dims_shape = tuple(upars.sizes[d] for d in sample_dims)
-
+    n_samples = upars.sizes["chain"] * upars.sizes["draw"]
     n_samples_half = n_samples // 2
-    mean_original = np.mean(upars_values, axis=0) if dim > 0 else np.array([])
+
+    upars_stacked = upars.stack(__sample__=sample_dims).transpose("__sample__", param_dim)
+    mean_original = upars_stacked.mean(dim="__sample__")
 
     if total_shift is None or total_shift.size == 0:
         total_shift = np.zeros(dim)
@@ -174,107 +176,347 @@ def _split_moment_match(
         total_mapping = np.eye(dim)
 
     # Forward transformation
-    upars_trans = upars_values - mean_original[None, :]
-    upars_trans = upars_trans * total_scaling[None, :]
-    if cov:
-        upars_trans = upars_trans @ total_mapping.T
-    upars_trans = upars_trans + (total_shift + mean_original)[None, :]
+    upars_trans = upars_stacked - mean_original
+    upars_trans = upars_trans * xr.DataArray(total_scaling, dims=param_dim)
+    if cov and dim > 0:
+        upars_trans = xr.DataArray(
+            np.einsum("sp,pq->sq", upars_trans.data, total_mapping),
+            coords=upars_trans.coords,
+            dims=upars_trans.dims,
+        )
+    upars_trans = upars_trans + (xr.DataArray(total_shift, dims=param_dim) + mean_original)
 
     # Inverse transformation
-    upars_trans_inv = upars_values - mean_original[None, :]
+    upars_trans_inv = upars_stacked - mean_original
 
-    if cov:
-        upars_trans_inv = upars_trans_inv @ np.linalg.inv(total_mapping).T
+    if cov and dim > 0:
+        try:
+            inv_mapping = np.linalg.inv(total_mapping)
+            upars_trans_inv = xr.DataArray(
+                np.einsum("sp,pq->sq", upars_trans_inv.data, inv_mapping),
+                coords=upars_trans_inv.coords,
+                dims=upars_trans_inv.dims,
+            )
+        except np.linalg.LinAlgError:
+            warnings.warn("Could not invert mapping matrix. Using identity.", UserWarning)
 
-    upars_trans_inv = upars_trans_inv / total_scaling[None, :]
-    upars_trans_inv = upars_trans_inv + (mean_original - total_shift)[None, :]
+    upars_trans_inv = upars_trans_inv / xr.DataArray(total_scaling, dims=param_dim)
+    upars_trans_inv = upars_trans_inv + (mean_original - xr.DataArray(total_shift, dims=param_dim))
 
-    # Split transformations - first half gets forward transform
-    upars_trans_half = upars_values.copy()
-    upars_trans_half[:n_samples_half] = upars_trans[:n_samples_half]
+    upars_trans_half = upars_stacked.copy(deep=True).unstack("__sample__")
+    upars_trans_half = upars_trans_half.transpose(*sample_dims, param_dim)
+    upars_trans_half.values.reshape(-1, dim)[:n_samples_half] = upars_trans.values.reshape(-1, dim)[
+        :n_samples_half
+    ]
 
-    # Second half gets inverse transform
-    upars_trans_half_inv = upars_values.copy()
-    upars_trans_half_inv[n_samples_half:] = upars_trans_inv[n_samples_half:]
+    upars_trans_half_inv = upars_stacked.copy(deep=True).unstack("__sample__")
+    upars_trans_half_inv = upars_trans_half_inv.transpose(*sample_dims, param_dim)
+    upars_trans_half_inv.values.reshape(-1, dim)[n_samples_half:] = upars_trans_inv.values.reshape(
+        -1, dim
+    )[n_samples_half:]
 
     try:
-        log_prob_half_trans_np = log_prob_upars_fn(upars_trans_half)
-        log_prob_half_trans_inv_np = log_prob_upars_fn(upars_trans_half_inv)
+        log_prob_half_trans = log_prob_upars_fn(upars_trans_half)
+        log_prob_half_trans_inv = log_prob_upars_fn(upars_trans_half_inv)
     except Exception as e:
         raise ValueError(
             f"Could not compute log probabilities for transformed parameters: {e}"
         ) from e
 
     try:
-        log_liki_half_np = log_lik_i_upars_fn(upars_trans_half, i)
-
-        if hasattr(log_liki_half_np, "flatten"):
-            log_liki_half_np = log_liki_half_np.flatten()
-        if log_liki_half_np.shape[0] != n_samples:
+        log_liki_half = log_lik_i_upars_fn(upars_trans_half, i)
+        if not all(dim in log_liki_half.dims for dim in sample_dims) or len(
+            log_liki_half.dims
+        ) != len(sample_dims):
             raise ValueError(
-                f"log_lik_i_upars_fn output length ({log_liki_half_np.shape[0]}) "
-                f"does not match number of samples ({n_samples})"
+                f"log_lik_i_upars_fn must return a DataArray with dimensions {sample_dims}"
+            )
+        if (
+            log_liki_half.sizes["chain"] != upars.sizes["chain"]
+            or log_liki_half.sizes["draw"] != upars.sizes["draw"]
+        ):
+            raise ValueError(
+                "log_lik_i_upars_fn output shape does not match input sample dimensions"
             )
     except Exception as e:
         raise ValueError(f"Could not compute log likelihood for observation {i}: {e}") from e
 
     # Jacobian adjustment
+    log_jacobian_det = 0.0
     if dim > 0:
-        log_prob_half_trans_inv_np = (
-            log_prob_half_trans_inv_np
-            - np.sum(np.log(total_scaling))
-            - np.log(np.abs(np.linalg.det(total_mapping)))
-        )
+        log_jacobian_det = -np.sum(np.log(total_scaling))
+        if cov:
+            try:
+                sign, logdet = np.linalg.slogdet(total_mapping)
+                if sign <= 0:
+                    log_jacobian_det -= np.inf
+                else:
+                    log_jacobian_det -= logdet
+            except np.linalg.LinAlgError:
+                log_jacobian_det -= np.inf
 
-    # Multiple importance sampling (2 components essentially)
-    use_forward_log_prob = log_prob_half_trans_np > log_prob_half_trans_inv_np
-    raw_log_weights_half = -log_liki_half_np + log_prob_half_trans_np
+    log_prob_half_trans_inv_adj = log_prob_half_trans_inv + log_jacobian_det
 
-    raw_log_weights_half[use_forward_log_prob] = raw_log_weights_half[use_forward_log_prob] - (
-        log_prob_half_trans_np[use_forward_log_prob]
-        + np.log1p(
-            np.exp(
-                log_prob_half_trans_inv_np[use_forward_log_prob]
-                - log_prob_half_trans_np[use_forward_log_prob]
-            )
-        )
+    # Multiple importance sampling
+    use_forward_log_prob = log_prob_half_trans > log_prob_half_trans_inv_adj
+    raw_log_weights_half = -log_liki_half + log_prob_half_trans
+
+    log_sum_terms = xr.where(
+        use_forward_log_prob,
+        log_prob_half_trans
+        + xr.ufuncs.log1p(xr.ufuncs.exp(log_prob_half_trans_inv_adj - log_prob_half_trans)),
+        log_prob_half_trans_inv_adj
+        + xr.ufuncs.log1p(xr.ufuncs.exp(log_prob_half_trans - log_prob_half_trans_inv_adj)),
     )
 
-    raw_log_weights_half[~use_forward_log_prob] = raw_log_weights_half[~use_forward_log_prob] - (
-        log_prob_half_trans_inv_np[~use_forward_log_prob]
-        + np.log1p(
-            np.exp(
-                log_prob_half_trans_np[~use_forward_log_prob]
-                - log_prob_half_trans_inv_np[~use_forward_log_prob]
-            )
-        )
+    raw_log_weights_half -= log_sum_terms
+    raw_log_weights_half = xr.where(np.isnan(raw_log_weights_half), -np.inf, raw_log_weights_half)
+    raw_log_weights_half = xr.where(
+        np.isposinf(raw_log_weights_half), -np.inf, raw_log_weights_half
     )
 
-    raw_log_weights_half[np.isnan(raw_log_weights_half)] = -np.inf
-    is_pos_inf = np.isposinf(raw_log_weights_half)
-    raw_log_weights_half[is_pos_inf] = -np.inf  # type: ignore
+    # PSIS smoothing for half posterior
+    lwi_psis_da, _ = raw_log_weights_half.azstats.psislw(r_eff=reff, dims=sample_dims)
 
-    lwi_half_reshaped_np = raw_log_weights_half.reshape(original_dims_shape)
-    lwi_half_da = xr.DataArray(lwi_half_reshaped_np, coords=original_coords, dims=sample_dims)
+    lr_full = lwi_psis_da + log_liki_half
+    lr_full = xr.where(np.isnan(lr_full) | (np.isinf(lr_full) & (lr_full > 0)), -np.inf, lr_full)
 
-    # PSIS-LOO-CV weights
-    lwi_psis_da, _ = lwi_half_da.azstats.psislw(r_eff=reff, dims=sample_dims)
-
-    log_liki_half_reshaped_np = log_liki_half_np.reshape(original_dims_shape)
-    log_liki_half_da = xr.DataArray(
-        log_liki_half_reshaped_np, coords=original_coords, dims=sample_dims
-    )
-
-    lr_da = lwi_psis_da + log_liki_half_da
-    lr_da = xr.where(np.isnan(lr_da) | (np.isinf(lr_da) & (lr_da > 0)), -np.inf, lr_da)
-
-    lwfi_psis_da, _ = lr_da.azstats.psislw(r_eff=reff, dims=sample_dims)
+    # PSIS smoothing for full posterior
+    lwfi_psis_da, _ = lr_full.azstats.psislw(r_eff=reff, dims=sample_dims)
 
     return SplitMomentMatch(
         lwi=lwi_psis_da,
         lwfi=lwfi_psis_da,
-        log_liki=log_liki_half_da,
+        log_liki=log_liki_half,
         reff=reff,
+    )
+
+
+def _shift(upars, lwi):
+    """Shift a DataArray of parameters to their weighted mean."""
+    sample_dims = ["chain", "draw"]
+    param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_stacked = upars.stack(__sample__=sample_dims)
+    lwi_stacked = lwi.stack(__sample__=sample_dims)
+
+    upars_values = upars_stacked.transpose("__sample__", param_dim).data
+    lwi_values = lwi_stacked.transpose("__sample__").data
+
+    mean_original = np.mean(upars_values, axis=0)
+    weights = np.exp(
+        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
+    )
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    shift_vec = mean_weighted - mean_original
+    upars_new_values = upars_values + shift_vec[None, :]
+
+    upars_new_stacked = xr.DataArray(
+        upars_new_values,
+        dims=["__sample__", param_dim],
+        coords={
+            "__sample__": upars_stacked["__sample__"],
+            param_dim: upars_stacked[param_dim],
+        },
+    )
+    upars_new_da = upars_new_stacked.unstack("__sample__")
+    return ShiftResult(upars=upars_new_da, shift=shift_vec)
+
+
+def _shift_and_scale(upars, lwi):
+    """Shift parameters to weighted mean and scale marginal variances."""
+    sample_dims = ["chain", "draw"]
+    param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_stacked = upars.stack(__sample__=sample_dims)
+    lwi_stacked = lwi.stack(__sample__=sample_dims)
+
+    upars_values = upars_stacked.transpose("__sample__", param_dim).data
+    lwi_values = lwi_stacked.transpose("__sample__").data
+
+    mean_original = np.mean(upars_values, axis=0)
+    weights = np.exp(
+        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
+    )
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    shift_vec = mean_weighted - mean_original
+
+    var_weighted = np.sum(weights[:, None] * (upars_values - mean_weighted[None, :]) ** 2, axis=0)
+    ess_approx = 1.0 / np.sum(weights**2)
+
+    if ess_approx > 1:
+        var_weighted *= ess_approx / (ess_approx - 1)
+    else:
+        var_weighted = np.var(upars_values, axis=0)
+
+    var_original = np.var(upars_values, axis=0, ddof=1)
+
+    scaling_vec = np.ones_like(mean_original)
+    valid_mask = (var_original > 1e-9) & (var_weighted > 1e-9)
+    scaling_vec[valid_mask] = np.sqrt(var_weighted[valid_mask] / var_original[valid_mask])
+
+    upars_new_values = upars_values - mean_original[None, :]
+    upars_new_values = upars_new_values * scaling_vec[None, :]
+    upars_new_values = upars_new_values + mean_weighted[None, :]
+
+    upars_new_stacked = xr.DataArray(
+        upars_new_values,
+        dims=["__sample__", param_dim],
+        coords={
+            "__sample__": upars_stacked["__sample__"],
+            param_dim: upars_stacked[param_dim],
+        },
+    )
+    upars_new_da = upars_new_stacked.unstack("__sample__")
+    return ShiftAndScaleResult(upars=upars_new_da, shift=shift_vec, scaling=scaling_vec)
+
+
+def _shift_and_cov(upars, lwi):
+    """Shift parameters and scale covariance to match weighted covariance."""
+    sample_dims = ["chain", "draw"]
+    param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_stacked = upars.stack(__sample__=sample_dims)
+    lwi_stacked = lwi.stack(__sample__=sample_dims)
+
+    upars_values = upars_stacked.transpose("__sample__", param_dim).data
+    lwi_values = lwi_stacked.transpose("__sample__").data
+
+    mean_original = np.mean(upars_values, axis=0)
+    weights = np.exp(
+        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
+    )
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    shift_vec = mean_weighted - mean_original
+
+    cov_original = np.cov(upars_values, rowvar=False, ddof=1)
+    cov_weighted = np.cov(upars_values, rowvar=False, aweights=weights, ddof=0)
+
+    mapping_mat = np.eye(upars_values.shape[1])
+    try:
+        min_eig_orig = np.min(np.linalg.eigvalsh(cov_original))
+        min_eig_weighted = np.min(np.linalg.eigvalsh(cov_weighted))
+        jitter = 1e-6
+
+        if min_eig_orig <= 0:
+            cov_original += np.eye(cov_original.shape[0]) * (jitter - min_eig_orig)
+        if min_eig_weighted <= 0:
+            cov_weighted += np.eye(cov_weighted.shape[0]) * (jitter - min_eig_weighted)
+
+        chol_weighted = np.linalg.cholesky(cov_weighted)
+        chol_original = np.linalg.cholesky(cov_original)
+        mapping_mat = chol_weighted @ np.linalg.inv(chol_original)
+
+    except np.linalg.LinAlgError as e:
+        warnings.warn(
+            f"Cholesky decomposition failed during covariance matching: {e}. "
+            "The covariance structure of the (weighted) posterior samples could not be matched. "
+            "As a fallback, only the mean of the posterior samples is matched (shift is applied), "
+            "but the covariance structure transformation defaults to an identity mapping. "
+            "This can occur if the weighted covariance matrix is ill-conditioned or not "
+            "positive definite, potentially due to highly influential observations or model "
+            "misspecification. Consider checking Pareto k diagnostics and, if necessary, "
+            "revisiting the model specification.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    upars_new_values = upars_values - mean_original[None, :]
+    upars_new_values = upars_new_values @ mapping_mat.T
+    upars_new_values = upars_new_values + mean_weighted[None, :]
+
+    upars_new_stacked = xr.DataArray(
+        upars_new_values,
+        dims=["__sample__", param_dim],
+        coords={
+            "__sample__": upars_stacked["__sample__"],
+            param_dim: upars_stacked[param_dim],
+        },
+    )
+    upars_new_da = upars_new_stacked.unstack("__sample__")
+    return ShiftAndCovResult(upars=upars_new_da, shift=shift_vec, mapping=mapping_mat)
+
+
+def _get_log_likelihood_i(log_likelihood, i, obs_dims):
+    """Extract the log likelihood for a specific observation index `i`."""
+    if not obs_dims:
+        raise ValueError("log_likelihood must have observation dimensions.")
+
+    if len(obs_dims) == 1:
+        obs_dim = obs_dims[0]
+        if i < 0 or i >= log_likelihood.sizes[obs_dim]:
+            raise IndexError(f"Index {i} is out of bounds for dimension '{obs_dim}'.")
+        log_lik_i = log_likelihood.isel({obs_dim: i})
+    else:
+        stacked_obs_dim = "__obs__"
+        log_lik_stacked = log_likelihood.stack({stacked_obs_dim: obs_dims})
+        if i < 0 or i >= log_lik_stacked.sizes[stacked_obs_dim]:
+            raise IndexError(
+                f"Index {i} is out of bounds for stacked dimension '{stacked_obs_dim}'."
+            )
+        log_lik_i = log_lik_stacked.isel({stacked_obs_dim: i})
+    return log_lik_i
+
+
+def _recalculate_weights_k(
+    log_liki_new,
+    log_prob_new,
+    orig_log_prob,
+    reff,
+    sample_dims,
+):
+    """Recalculate importance weights and Pareto k after parameter transformation."""
+    log_ratio_i = -log_liki_new + log_prob_new - orig_log_prob
+    log_ratio_i = xr.where(np.isnan(log_ratio_i), -np.inf, log_ratio_i)
+
+    lwi_new, ki_new = log_ratio_i.azstats.psislw(r_eff=reff, dims=sample_dims)
+    ki_new = ki_new[0].item() if isinstance(ki_new, tuple) else ki_new.item()
+
+    log_ratio_full = log_prob_new - orig_log_prob
+    log_ratio_full = xr.where(np.isnan(log_ratio_full), -np.inf, log_ratio_full)
+
+    lwfi_new, kfi_new = log_ratio_full.azstats.psislw(r_eff=reff, dims=sample_dims)
+    kfi_new = kfi_new[0].item() if isinstance(kfi_new, tuple) else kfi_new.item()
+
+    return RecalculateWeightsResult(
+        lwi=lwi_new, lwfi=lwfi_new, ki=ki_new, kfi=kfi_new, log_liki=log_liki_new
+    )
+
+
+def _update_loo_data_i(
+    loo_data,
+    i,
+    new_elpd_i,
+    new_pareto_k,
+    log_liki,
+    sample_dims,
+    obs_dims,
+    n_samples,
+):
+    """Update the ELPDData object for a single observation."""
+    if loo_data.elpd_i is None or loo_data.pareto_k is None:
+        raise ValueError("loo_data must contain pointwise elpd_i and pareto_k values.")
+
+    lpd_i = logsumexp(log_liki, dims=sample_dims, b=1 / n_samples).item()
+    p_loo_i = lpd_i - new_elpd_i
+
+    if len(obs_dims) == 1:
+        idx_dict = {obs_dims[0]: i}
+    else:
+        coords = np.unravel_index(i, tuple(loo_data.elpd_i.sizes[d] for d in obs_dims))
+        idx_dict = dict(zip(obs_dims, coords))
+
+    loo_data.elpd_i[idx_dict] = new_elpd_i
+    loo_data.pareto_k[idx_dict] = new_pareto_k
+
+    if not hasattr(loo_data, "p_loo_i") or loo_data.p_loo_i is None:
+        loo_data.p_loo_i = xr.full_like(loo_data.elpd_i, np.nan)
+
+    loo_data.p_loo_i[idx_dict] = p_loo_i
+
+    loo_data.elpd = float(np.nansum(loo_data.elpd_i.values))
+    loo_data.p = float(np.nansum(loo_data.p_loo_i.values))
+    loo_data.se = float(np.sqrt(loo_data.n_data_points * np.nanvar(loo_data.elpd_i.values)))
+
+    loo_data.warning, loo_data.good_k = _warn_pareto_k(
+        loo_data.pareto_k.values[~np.isnan(loo_data.pareto_k.values)], loo_data.n_samples
     )
 
 

@@ -1,6 +1,7 @@
 """Pareto-smoothed importance sampling LOO (PSIS-LOO-CV) related functions."""
 
 import itertools
+import warnings
 from collections import namedtuple
 from copy import deepcopy
 
@@ -15,16 +16,24 @@ from xarray_einstats.stats import logsumexp
 from arviz_stats.helper_loo import (
     _check_log_density,
     _diff_srs_estimator,
+    _get_log_likelihood_i,
     _get_r_eff,
     _prepare_full_arrays,
     _prepare_loo_inputs,
     _prepare_subsample,
     _prepare_update_subsample,
+    _recalculate_weights_k,
     _select_obs_by_coords,
+    _shift,
+    _shift_and_cov,
+    _shift_and_scale,
+    _split_moment_match,
     _srs_estimator,
+    _update_loo_data_i,
     _warn_pareto_k,
     _warn_pointwise_loo,
 )
+from arviz_stats.sampling_diagnostics import ess
 from arviz_stats.utils import ELPDData, get_log_likelihood_dataset, round_num
 
 
@@ -1169,6 +1178,423 @@ def update_subsample(
         log_q,
         thin,
     )
+
+
+def loo_moment_match(
+    data,
+    loo_orig,
+    upars,
+    log_prob_upars_fn,
+    log_lik_i_upars_fn,
+    max_iters=30,
+    k_threshold=None,
+    split=True,
+    cov=False,
+    pointwise=None,
+    var_name=None,
+    reff=None,
+):
+    r"""Compute moment matching for problematic observations in PSIS-LOO-CV.
+
+    Adjusts the results of a previously computed Pareto smoothed importance sampling leave-one-out
+    cross-validation (PSIS-LOO-CV) object by applying a moment matching algorithm to
+    observations with high Pareto k diagnostic values. The moment matching algorithm iteratively
+    adjusts the posterior draws in the unconstrained parameter space to better approximate the
+    leave-one-out posterior. This improves the accuracy of PSIS-LOO-CV estimates without the need
+    for exact refitting.
+
+    The moment matching algorithm is described in [1]_ and the general PSIS-LOO-CV method is
+    described in [2]_ and [3]_.
+
+    Parameters
+    ----------
+    data : DataTree or InferenceData
+        Input data. It should contain the posterior and the log_likelihood groups.
+    loo_orig : ELPDData
+        An existing ELPDData object from a previous `loo` result. It must contain
+        pointwise Pareto k values (`pointwise=True` must have been used).
+    upars : DataArray
+        A :class:`~xarray.DataArray` of the posterior draws transformed to the
+        unconstrained parameter space. It must have "chain" and "draw" dimensions.
+        If it has a third dimension, this dimension represents the different
+        unconstrained parameters. If it only has "chain" and "draw" dimensions, it
+        is assumed to represent a single unconstrained parameter and will be expanded internally.
+    log_prob_upars_fn : Callable[[DataArray], DataArray]
+        A function that takes the unconstrained parameter draws and returns a
+        :class:`~xarray.DataArray` containing the log probability density of the full posterior
+        distribution evaluated at each unconstrained parameter draw. The returned DataArray must
+        have dimensions "chain", "draw".
+    log_lik_i_upars_fn : Callable[[DataArray, int], DataArray]
+        A function that takes the unconstrained parameter draws and the integer index `i`
+        of the left-out observation. It should return a :class:`~xarray.DataArray` containing the
+        log-likelihood of the left-out observation `i` evaluated at each unconstrained parameter
+        draw. The returned DataArray must have dimensions "chain", "draw".
+    max_iters : int, default 30
+        Maximum number of moment matching iterations for each problematic observation.
+    k_threshold : float, optional
+        Threshold value for Pareto k values above which moment matching is applied.
+        Defaults to :math:`\min(1 - 1/\log_{10}(S), 0.7)`, where S is the number of samples.
+    split : bool, default True
+        If True, only transform half of the draws and use multiple importance sampling to combine
+        them with untransformed draws.
+    cov : bool, default False
+        If True, match the covariance structure during the transformation, in addition
+        to the mean and marginal variances. Ignored if ``split=False``.
+    pointwise: bool, optional
+        If True the pointwise predictive accuracy will be returned. Defaults to
+        ``rcParams["stats.ic_pointwise"]``. Note: Moment matching always requires
+        pointwise data from `loo_orig`. This argument controls whether the *returned*
+        object includes pointwise data.
+    var_name : str, optional
+        The name of the variable in log_likelihood groups storing the pointwise log
+        likelihood data to use for loo computation.
+    reff: float, optional
+        Relative MCMC efficiency, ``ess / n`` i.e. number of effective samples divided by the number
+        of actual samples. Computed from trace by default.
+
+    Returns
+    -------
+    ELPDData
+        Object with the following attributes:
+
+        - **elpd**: expected log pointwise predictive density
+        - **se**: standard error of the elpd
+        - **p**: effective number of parameters
+        - **n_samples**: number of samples
+        - **n_data_points**: number of data points
+        - **warning**: True if the estimated shape parameter of Pareto distribution is greater
+          than ``good_k``.
+        - **elp_i**: :class:`~xarray.DataArray` with the pointwise predictive accuracy, only if
+          ``pointwise=True``
+        - **pareto_k**: array of Pareto shape values, only if ``pointwise=True``
+        - **good_k**: For a sample size S, the threshold is computed as
+          ``min(1 - 1/log10(S), 0.7)``
+        - **approx_posterior**: True if approximate posterior was used.
+
+    Notes
+    -----
+    The moment matching algorithm considers three affine transformations of the posterior draws.
+    For a specific draw :math:`\theta^{(s)}`, a generic affine transformation includes a square
+    matrix :math:`\mathbf{A}` representing a linear map and a vector :math:`\mathbf{b}`
+    representing a translation such that
+
+    .. math::
+        T : \theta^{(s)} \mapsto \mathbf{A}\theta^{(s)} + \mathbf{b}
+        =: \theta^{*{(s)}}.
+
+    The first transformation :math:`T_1` is a translation that matches the mean of the sample
+    to its importance weighted mean given by
+
+    .. math::
+        \mathbf{\theta^{*{(s)}}} = T_1(\mathbf{\theta^{(s)}}) =
+        \mathbf{\theta^{(s)}} - \bar{\theta} + \bar{\theta}_w,
+
+    where :math:`\bar{\theta}` is the mean of the sample and :math:`\bar{\theta}_w` is the
+    importance weighted mean of the sample. The second transformation :math:`T_2` is a scaling that
+    matches the marginal variances in addition to the means given by
+
+    .. math::
+        \mathbf{\theta^{*{(s)}}} = T_2(\mathbf{\theta^{(s)}}) =
+        \mathbf{v}^{1/2}_w \circ \mathbf{v}^{-1/2} \circ (\mathbf{\theta^{(s)}} - \bar{\theta}) +
+        \bar{\theta}_w,
+
+    where :math:`\mathbf{v}` and :math:`\mathbf{v}_w` are the sample and weighted variances.
+    The third transformation :math:`T_3` is a covariance transformation that matches the covariance
+    matrix of the sample to its importance weighted covariance matrix given by
+
+    .. math::
+        \mathbf{\theta^{*{(s)}}} = T_3(\mathbf{\theta^{(s)}}) =
+        \mathbf{L}_w \mathbf{L}^{-1} (\mathbf{\theta^{(s)}} - \bar{\theta}) + \bar{\theta}_w,
+
+    where :math:`\mathbf{L}` and :math:`\mathbf{L}_w` are the Cholesky decompositions of the
+    covariance matrix and the weighted covariance matrix, respectively, e.g.,
+
+    .. math::
+        \mathbf{LL}^T = \mathbf{\Sigma} = \frac{1}{S} \sum_{s=1}^S (\mathbf{\theta^{(s)}} -
+        \bar{\theta}) (\mathbf{\theta^{(s)}} - \bar{\theta})^T,
+
+    and
+
+    .. math::
+        \mathbf{L}_w \mathbf{L}_w^T = \mathbf{\Sigma}_w = \frac{\frac{1}{S} \sum_{s=1}^S
+        w^{(s)} (\mathbf{\theta^{(s)}} - \bar{\theta}_w) (\mathbf{\theta^{(s)}} -
+        \bar{\theta}_w)^T}{\sum_{s=1}^S w^{(s)}},
+
+    We iterate on :math:`T_1` repeatedly and move onto :math:`T_2` and :math:`T_3` only
+    if :math:`T_1` fails to yield a Pareto-k statistic below the threshold.
+
+    See Also
+    --------
+    loo : Standard PSIS-LOO-CV.
+    loo_approximate_posterior : Approximate posterior PSIS-LOO-CV.
+    loo_subsample : Sub-sampled PSIS-LOO-CV.
+
+    References
+    ----------
+    .. [1] Paananen, T., Piironen, J., Buerkner, P.-C., Vehtari, A. (2021). Implicitly Adaptive
+        Importance Sampling. Statistics and Computing. 31(2) (2021)
+        https://doi.org/10.1007/s11222-020-09982-2
+        arXiv preprint https://arxiv.org/abs/1906.08850.
+    .. [2] Vehtari et al. *Practical Bayesian model evaluation using leave-one-out cross-validation
+        and WAIC*. Statistics and Computing. 27(5) (2017) https://doi.org/10.1007/s11222-016-9696-4
+        arXiv preprint https://arxiv.org/abs/1507.04544.
+    .. [3] Vehtari et al. *Pareto Smoothed Importance Sampling*.
+        Journal of Machine Learning Research, 25(72) (2024) https://jmlr.org/papers/v25/19-556.html
+        arXiv preprint https://arxiv.org/abs/1507.02646
+    """
+    if not isinstance(loo_orig, ELPDData):
+        raise TypeError("loo_orig must be an ELPDData object.")
+    if loo_orig.pareto_k is None or loo_orig.elpd_i is None:
+        raise ValueError(
+            "Moment matching requires pointwise LOO results with Pareto k values. "
+            "Please compute the initial LOO with pointwise=True."
+        )
+
+    sample_dims = ["chain", "draw"]
+
+    if not isinstance(upars, xr.DataArray):
+        raise TypeError("upars must be a DataArray.")
+    if not all(dim_name in upars.dims for dim_name in sample_dims):
+        raise ValueError(f"upars must have dimensions {sample_dims}.")
+
+    param_dim_list = [dim for dim in upars.dims if dim not in sample_dims]
+
+    if len(param_dim_list) == 0:
+        param_dim_name = "_upars_dim_"
+        upars.expand_dims(dim={param_dim_name: 1})
+    elif len(param_dim_list) == 1:
+        param_dim_name = param_dim_list[0]
+    else:
+        raise ValueError("upars must have at most one dimension besides 'chain' and 'draw'.")
+
+    loo_data = deepcopy(loo_orig)
+    loo_data.method = "loo_moment_match"
+    pointwise = rcParams["stats.ic_pointwise"] if pointwise is None else pointwise
+
+    loo_inputs = _prepare_loo_inputs(data, var_name)
+    log_likelihood = loo_inputs.log_likelihood
+    obs_dims = loo_inputs.obs_dims
+    n_samples = loo_inputs.n_samples
+    var_name = loo_inputs.var_name
+
+    if reff is None:
+        reff = _get_r_eff(data, n_samples)
+
+    try:
+        orig_log_prob = log_prob_upars_fn(upars)
+        if not isinstance(orig_log_prob, xr.DataArray):
+            raise TypeError("log_prob_upars_fn must return a DataArray.")
+        if not all(dim in orig_log_prob.dims for dim in sample_dims):
+            raise ValueError(f"Original log probability must have dimensions {sample_dims}.")
+        if len(orig_log_prob.dims) != len(sample_dims):
+            raise ValueError(
+                f"Original log probability should only have dimensions {sample_dims}, "
+                f"found {orig_log_prob.dims}"
+            )
+    except Exception as e:
+        raise ValueError(f"Error executing log_prob_upars_fn: {e}") from e
+
+    if k_threshold is None:
+        k_threshold = min(1 - 1 / np.log10(n_samples), 0.7) if n_samples > 1 else 0.7
+
+    ks = loo_data.pareto_k.stack(__obs__=obs_dims).transpose("__obs__").values
+    bad_obs_indices = np.where(ks > k_threshold)[0]
+
+    if len(bad_obs_indices) == 0:
+        warnings.warn("No Pareto k values exceed the threshold. Returning original LOO data.")
+        if not pointwise:
+            loo_data.elpd_i = None
+            loo_data.pareto_k = None
+            if hasattr(loo_data, "p_loo_i"):
+                loo_data.p_loo_i = None
+        return loo_data
+
+    # Moment matching algorithm
+    for i in bad_obs_indices:
+        log_liki = _get_log_likelihood_i(log_likelihood, i, obs_dims)
+        log_ratio_i_init = -log_liki
+        lwi, ki_tuple = log_ratio_i_init.azstats.psislw(r_eff=reff, dims=sample_dims)
+
+        ki = ki_tuple[0].item() if isinstance(ki_tuple, tuple) else ki_tuple.item()
+        ess_val = ess(log_liki.values.reshape(-1, 1), method="mean").item()
+        reff_i = ess_val / n_samples if n_samples > 0 else 1.0
+
+        upars_i = upars.copy(deep=True)
+        total_shift = np.zeros(upars_i.sizes[param_dim_name])
+        total_scaling = np.ones(upars_i.sizes[param_dim_name])
+        total_mapping = np.eye(upars_i.sizes[param_dim_name])
+
+        iterind = 1
+        transformations_applied = False
+
+        while iterind <= max_iters and ki > k_threshold:
+            improved_in_iteration = False
+
+            # Mean Shift
+            shift_res = _shift(upars_i, lwi)
+            try:
+                log_prob_shifted = log_prob_upars_fn(shift_res.upars)
+                log_liki_shifted = log_lik_i_upars_fn(shift_res.upars, i)
+                weights_k_res = _recalculate_weights_k(
+                    log_liki_shifted, log_prob_shifted, orig_log_prob, reff_i, sample_dims
+                )
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error during mean shift calculation for observation {i}: {e}. "
+                    "Skipping transformation step.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
+
+            if weights_k_res.ki < ki:
+                ki = weights_k_res.ki
+                lwi = weights_k_res.lwi
+                log_liki = weights_k_res.log_liki
+                upars_i = shift_res.upars
+                total_shift += shift_res.shift
+                improved_in_iteration = True
+                transformations_applied = True
+
+            # Scale Shift
+            scale_res = _shift_and_scale(upars_i, lwi)
+            try:
+                log_prob_scaled = log_prob_upars_fn(scale_res.upars)
+                log_liki_scaled = log_lik_i_upars_fn(scale_res.upars, i)
+                weights_k_res_scale = _recalculate_weights_k(
+                    log_liki_scaled, log_prob_scaled, orig_log_prob, reff_i, sample_dims
+                )
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error during scale shift calculation for observation {i}: {e}. "
+                    "Skipping transformation step.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                if improved_in_iteration:
+                    continue
+                break
+
+            if weights_k_res_scale.ki < ki:
+                ki = weights_k_res_scale.ki
+                lwi = weights_k_res_scale.lwi
+                log_liki = weights_k_res_scale.log_liki
+                upars_i = scale_res.upars
+                total_shift = scale_res.shift + total_shift * scale_res.scaling
+                total_scaling *= scale_res.scaling
+                improved_in_iteration = True
+                transformations_applied = True
+
+            # Covariance Shift
+            if cov:
+                cov_res = _shift_and_cov(upars_i, lwi)
+                try:
+                    log_prob_cov = log_prob_upars_fn(cov_res.upars)
+                    log_liki_cov = log_lik_i_upars_fn(cov_res.upars, i)
+                    weights_k_res_cov = _recalculate_weights_k(
+                        log_liki_cov, log_prob_cov, orig_log_prob, reff_i, sample_dims
+                    )
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"Error during covariance shift calculation for observation {i}: {e}. "
+                        "Skipping transformation step.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    if improved_in_iteration:
+                        continue
+                    break
+
+                if weights_k_res_cov.ki < ki:
+                    ki = weights_k_res_cov.ki
+                    lwi = weights_k_res_cov.lwi
+                    log_liki = weights_k_res_cov.log_liki
+                    upars_i = cov_res.upars
+                    total_shift = cov_res.shift + total_shift @ cov_res.mapping.T
+                    total_mapping = cov_res.mapping @ total_mapping
+                    improved_in_iteration = True
+                    transformations_applied = True
+
+            if not improved_in_iteration:
+                break  # Stop iterations if no improvement in this round
+
+            iterind += 1
+            if iterind > max_iters:
+                warnings.warn(
+                    f"Maximum number of moment matching iterations ({max_iters}) reached "
+                    f"for observation {i}. Final Pareto k is {ki:.2f}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        final_log_liki = log_liki
+        final_lwi = lwi
+        final_ki = ki
+
+        if split and transformations_applied:
+            try:
+                split_res = _split_moment_match(
+                    upars=upars,
+                    cov=cov,
+                    total_shift=total_shift,
+                    total_scaling=total_scaling,
+                    total_mapping=total_mapping,
+                    i=i,
+                    reff=reff_i,
+                    log_prob_upars_fn=log_prob_upars_fn,
+                    log_lik_i_upars_fn=log_lik_i_upars_fn,
+                )
+
+                _, ki_split_tuple = split_res.lwi.azstats.psislw(
+                    r_eff=split_res.reff, dims=sample_dims
+                )
+                ki_split = (
+                    ki_split_tuple[0].item()
+                    if isinstance(ki_split_tuple, tuple)
+                    else ki_split_tuple.item()
+                )
+
+                # Use split result only if it improves k or k was already good
+                if ki_split < ki or ki <= k_threshold:
+                    final_log_liki = split_res.log_liki
+                    final_lwi = split_res.lwi
+                    final_ki = ki_split
+                else:
+                    warnings.warn(
+                        f"Split transformation did not improve Pareto k for observation {i} "
+                        f"({ki_split:.2f} vs {ki:.2f}). Using non-split result.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error during split moment matching for observation {i}: {e}. "
+                    "Using non-split transformation result.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        new_elpd_i = logsumexp(final_log_liki + final_lwi, dims=sample_dims).item()
+        _update_loo_data_i(
+            loo_data, i, new_elpd_i, final_ki, final_log_liki, sample_dims, obs_dims, n_samples
+        )
+
+    final_ks = loo_data.pareto_k.stack(__obs__=obs_dims).transpose("__obs__").values
+    if np.any(final_ks[bad_obs_indices] > k_threshold):
+        warnings.warn(
+            f"After Moment Matching, {np.sum(final_ks > k_threshold)} observations still have "
+            f"Pareto k > {k_threshold:.2f}.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if not pointwise:
+        loo_data.elpd_i = None
+        loo_data.pareto_k = None
+        if hasattr(loo_data, "p_loo_i"):
+            loo_data.p_loo_i = None
+    return loo_data
 
 
 def compare(

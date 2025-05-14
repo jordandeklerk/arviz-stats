@@ -440,18 +440,31 @@ def test_prepare_update_subsample(centered_eight, log_lik_fn, method):
 
 @pytest.fixture(scope="module")
 def mock_log_prob_upars_fn():
-    def _mock_fn(upars):
-        return np.sum(upars, axis=1)
+    def _mock_fn(upars_da):
+        sample_dims = ["chain", "draw"]
+        param_dims = [d for d in upars_da.dims if d not in sample_dims]
+
+        log_prob_values = None
+        if not param_dims:
+            log_prob_values = upars_da
+        elif len(param_dims) == 1:
+            log_prob_values = upars_da.sum(dim=param_dims[0])
+        return log_prob_values.transpose(*sample_dims)
 
     return _mock_fn
 
 
 @pytest.fixture(scope="module")
 def mock_log_lik_i_upars_fn():
-    def _mock_fn(upars, i):  # pylint: disable=unused-argument
-        total_samples = upars.shape[0]
+    def _mock_fn(upars_da, i):
+        sample_dims = ["chain", "draw"]
+
+        coords = {dim: upars_da[dim] for dim in sample_dims}
+        shape = tuple(upars_da.sizes[dim] for dim in sample_dims)
+
         rng = np.random.default_rng(i + 42)
-        return -float(i + 1) + rng.normal(0, 0.01, size=total_samples)
+        log_lik_values = -float(i + 1) + rng.normal(0, 0.01, size=shape)
+        return xr.DataArray(log_lik_values, dims=sample_dims, coords=coords)
 
     return _mock_fn
 
@@ -527,10 +540,10 @@ def test_split_moment_match_general(
             assert_allclose(result.log_liki.coords[dim].values, upars_da.coords[dim].values)
 
 
-def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
+def test_split_moment_match_error_upars_type(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
     with pytest.raises(TypeError, match="upars must be a DataArray"):
         _split_moment_match(
-            upars=np.random.randn(10, 2),
+            upars=np.random.randn(2, 1000, 3),
             cov=False,
             total_shift=None,
             total_scaling=None,
@@ -541,6 +554,8 @@ def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_
             log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
         )
 
+
+def test_split_moment_match_error_upars_dims(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
     upars_no_sample_dim = xr.DataArray(
         np.random.randn(3), dims=["param"], coords={"param": ["a", "b", "c"]}
     )
@@ -557,18 +572,22 @@ def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_
             log_lik_i_upars_fn=mock_log_lik_i_upars_fn,
         )
 
-    upars_for_lik_len_test = xr.DataArray(
-        np.random.randn(2, 5, 2),
+
+def test_split_moment_match_error_log_lik_i_shape(mock_log_prob_upars_fn):
+    upars_for_lik_shape_test = xr.DataArray(
+        np.random.randn(2, 1000, 3),
         dims=["chain", "draw", "param"],
-        coords={"chain": np.arange(2), "draw": np.arange(5), "param": ["p1", "p2"]},
+        coords={"chain": np.arange(2), "draw": np.arange(1000), "param": ["p1", "p2", "p3"]},
     )
 
-    def bad_log_lik_fn(upars_np, i):  # pylint: disable=unused-argument
-        return np.full(upars_np.shape[0] - 1, -1.0)
+    def bad_log_lik_fn_shape(upars_da, i):  # pylint: disable=unused-argument
+        return xr.DataArray(np.random.randn(upars_da.sizes["chain"]), dims=["chain"])
 
-    with pytest.raises(ValueError, match="log_lik_i_upars_fn output length"):
+    with pytest.raises(
+        ValueError, match="log_lik_i_upars_fn must return a DataArray with dimensions"
+    ):
         _split_moment_match(
-            upars=upars_for_lik_len_test,
+            upars=upars_for_lik_shape_test,
             cov=False,
             total_shift=None,
             total_scaling=None,
@@ -576,17 +595,18 @@ def test_split_moment_match_input_errors(mock_log_prob_upars_fn, mock_log_lik_i_
             i=0,
             reff=1.0,
             log_prob_upars_fn=mock_log_prob_upars_fn,
-            log_lik_i_upars_fn=bad_log_lik_fn,
+            log_lik_i_upars_fn=bad_log_lik_fn_shape,
         )
 
-    upars_for_inv_error = xr.DataArray(
-        np.random.randn(2, 10, 2),
-        dims=("chain", "draw", "param"),
-        coords={"chain": range(2), "draw": range(10), "param": ["p1", "p2"]},
-    )
 
-    non_invertible_map = np.array([[1.0, 1.0], [1.0, 1.0]])
-    with pytest.raises(np.linalg.LinAlgError):
+def test_split_moment_match_warning_inv_mapping(mock_log_prob_upars_fn, mock_log_lik_i_upars_fn):
+    upars_for_inv_error = xr.DataArray(
+        np.random.randn(2, 1000, 3),
+        dims=("chain", "draw", "param"),
+        coords={"chain": range(2), "draw": range(1000), "param": ["p1", "p2", "p3"]},
+    )
+    non_invertible_map = np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+    with pytest.warns(UserWarning, match="Could not invert mapping matrix"):
         _split_moment_match(
             upars=upars_for_inv_error,
             cov=True,
