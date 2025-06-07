@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_almost_equal
 
-from .helpers import importorskip
+from .helpers import create_binary_data, importorskip
 
 azb = importorskip("arviz_base")
 xr = importorskip("xarray")
@@ -34,9 +34,9 @@ def fixture_non_centered_eight():
     return azb.load_arviz_data("non_centered_eight")
 
 
-@pytest.fixture(name="anes", scope="session")
-def fixture_anes():
-    return azb.load_arviz_data("anes")
+@pytest.fixture(name="binary", scope="session")
+def fixture_binary():
+    return create_binary_data()
 
 
 @pytest.fixture(name="radon_problematic", scope="session")
@@ -188,7 +188,7 @@ def test_calculate_ics_pointwise_error(centered_eight, non_centered_eight):
     ],
 )
 def test_loo_expectations(centered_eight, kind, probs, expected_vals):
-    loo_exp_vals = loo_expectations(centered_eight, kind=kind, probs=probs)
+    loo_exp_vals, _ = loo_expectations(centered_eight, kind=kind, probs=probs)
 
     if kind == "quantile":
         assert loo_exp_vals.shape == (2, 8)
@@ -196,6 +196,43 @@ def test_loo_expectations(centered_eight, kind, probs, expected_vals):
         assert loo_exp_vals.shape == (8,)
 
     assert_almost_equal(loo_exp_vals.sel({"school": "Choate"}), expected_vals, decimal=2)
+
+
+@pytest.mark.parametrize("kind", ["mean", "var", "quantile"])
+def test_loo_expectations_khat(centered_eight, radon_problematic, kind):
+    probs = [0.25, 0.75] if kind == "quantile" else None
+    result, khat = loo_expectations(centered_eight, kind=kind, probs=probs)
+
+    assert np.all(np.isfinite(khat.values))
+    assert np.all(khat.values >= -0.5) and np.all(khat.values <= 1.5)
+
+    if kind == "quantile":
+        expected_dims = tuple(d for d in result.dims if d != "quantile")
+        assert khat.dims == expected_dims
+        assert khat.shape == tuple(result.sizes[d] for d in expected_dims)
+    else:
+        assert khat.dims == result.dims
+        assert khat.shape == result.shape
+
+    assert len(np.unique(khat.values.flatten())) > 1
+
+    for dim_name in khat.dims:
+        khat_coord_vals = khat.coords[dim_name].values
+        result_coord_vals = result.coords[dim_name].values
+        if khat_coord_vals.dtype.kind in ("U", "S", "O"):
+            assert np.array_equal(khat_coord_vals, result_coord_vals)
+        else:
+            assert_allclose(khat_coord_vals, result_coord_vals)
+
+    _, khat_check = loo_expectations(radon_problematic, var_name="y", kind=kind, probs=probs)
+    n_samples = (
+        radon_problematic.log_likelihood["y"].sizes["chain"]
+        * radon_problematic.log_likelihood["y"].sizes["draw"]
+    )
+    good_k = min(1 - 1 / np.log10(n_samples), 0.7) if n_samples > 1 else 0.7
+    if np.any(khat_check.values > good_k):
+        with pytest.warns(UserWarning, match="Estimated shape parameter of Pareto distribution"):
+            loo_expectations(radon_problematic, var_name="y", kind=kind, probs=probs)
 
 
 @pytest.mark.parametrize(
@@ -215,12 +252,12 @@ def test_loo_metrics(centered_eight, kind, round_to, expected_mean, expected_se)
 @pytest.mark.parametrize(
     "kind, round_to, expected_mean, expected_se",
     [
-        ("acc", 2, 0.82, 0.02),
-        ("acc_balanced", "2g", 0.81, 0.0039),
+        ("acc", 2, 0.86, 0.07),
+        ("acc_balanced", "2g", 0.87, 0.012),
     ],
 )
-def test_loo_metrics_acc(anes, kind, round_to, expected_mean, expected_se):
-    metrics = loo_metrics(anes, kind=kind, round_to=round_to)
+def test_loo_metrics_acc(binary, kind, round_to, expected_mean, expected_se):
+    metrics = loo_metrics(binary, kind=kind, round_to=round_to)
     assert_almost_equal(metrics.mean, expected_mean, decimal=4)
     assert_almost_equal(metrics.se, expected_se, decimal=4)
 
