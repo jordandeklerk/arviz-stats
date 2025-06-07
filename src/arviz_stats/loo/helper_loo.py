@@ -71,6 +71,8 @@ def _shift(upars, lwi):
     """Shift a DataArray of parameters to their weighted mean."""
     sample_dims = ["chain", "draw"]
     param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_props = _get_upars_info(upars, param_dim)
+
     upars_stacked = upars.stack(__sample__=sample_dims)
     lwi_stacked = lwi.stack(__sample__=sample_dims)
 
@@ -78,22 +80,13 @@ def _shift(upars, lwi):
     lwi_values = lwi_stacked.transpose("__sample__").data
 
     mean_original = np.mean(upars_values, axis=0)
-    weights = np.exp(
-        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
-    )
-    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    weights_unnorm = np.exp(lwi_values)
+    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
     shift_vec = mean_weighted - mean_original
     upars_new_values = upars_values + shift_vec[None, :]
 
-    upars_new_stacked = xr.DataArray(
-        upars_new_values,
-        dims=["__sample__", param_dim],
-        coords={
-            "__sample__": upars_stacked["__sample__"],
-            param_dim: upars_stacked[param_dim],
-        },
-    )
-    upars_new_da = upars_new_stacked.unstack("__sample__")
+    upars_new_da = _reconstruct_upars(upars_new_values, upars_props)
+
     return ShiftResult(upars=upars_new_da, shift=shift_vec)
 
 
@@ -101,46 +94,36 @@ def _shift_and_scale(upars, lwi):
     """Shift parameters to weighted mean and scale marginal variances."""
     sample_dims = ["chain", "draw"]
     param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_props = _get_upars_info(upars, param_dim)
+
     upars_stacked = upars.stack(__sample__=sample_dims)
     lwi_stacked = lwi.stack(__sample__=sample_dims)
 
     upars_values = upars_stacked.transpose("__sample__", param_dim).data
     lwi_values = lwi_stacked.transpose("__sample__").data
 
+    n_samples = upars_values.shape[0]
+
     mean_original = np.mean(upars_values, axis=0)
-    weights = np.exp(
-        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
-    )
-    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    weights_unnorm = np.exp(lwi_values)
+    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
     shift_vec = mean_weighted - mean_original
 
-    var_weighted = np.sum(weights[:, None] * (upars_values - mean_weighted[None, :]) ** 2, axis=0)
-    ess_approx = 1.0 / np.sum(weights**2)
-
-    if ess_approx > 1:
-        var_weighted *= ess_approx / (ess_approx - 1)
-    else:
-        var_weighted = np.var(upars_values, axis=0)
+    mii = np.sum(weights_unnorm[:, None] * upars_values**2, axis=0) - mean_weighted**2
+    mii = mii * n_samples / (n_samples - 1)
 
     var_original = np.var(upars_values, axis=0, ddof=1)
 
     scaling_vec = np.ones_like(mean_original)
-    valid_mask = (var_original > 1e-9) & (var_weighted > 1e-9)
-    scaling_vec[valid_mask] = np.sqrt(var_weighted[valid_mask] / var_original[valid_mask])
+    valid_mask = (var_original > 1e-9) & (mii > 1e-9)
+    scaling_vec[valid_mask] = np.sqrt(mii[valid_mask] / var_original[valid_mask])
 
     upars_new_values = upars_values - mean_original[None, :]
     upars_new_values = upars_new_values * scaling_vec[None, :]
     upars_new_values = upars_new_values + mean_weighted[None, :]
 
-    upars_new_stacked = xr.DataArray(
-        upars_new_values,
-        dims=["__sample__", param_dim],
-        coords={
-            "__sample__": upars_stacked["__sample__"],
-            param_dim: upars_stacked[param_dim],
-        },
-    )
-    upars_new_da = upars_new_stacked.unstack("__sample__")
+    upars_new_da = _reconstruct_upars(upars_new_values, upars_props)
+
     return ShiftAndScaleResult(upars=upars_new_da, shift=shift_vec, scaling=scaling_vec)
 
 
@@ -148,6 +131,8 @@ def _shift_and_cov(upars, lwi):
     """Shift parameters and scale covariance to match weighted covariance."""
     sample_dims = ["chain", "draw"]
     param_dim = [dim for dim in upars.dims if dim not in sample_dims][0]
+    upars_props = _get_upars_info(upars, param_dim)
+
     upars_stacked = upars.stack(__sample__=sample_dims)
     lwi_stacked = lwi.stack(__sample__=sample_dims)
 
@@ -155,14 +140,14 @@ def _shift_and_cov(upars, lwi):
     lwi_values = lwi_stacked.transpose("__sample__").data
 
     mean_original = np.mean(upars_values, axis=0)
-    weights = np.exp(
-        lwi_values - logsumexp(lwi_stacked.transpose("__sample__"), dims="__sample__").data
-    )
-    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0)
+    weights_unnorm = np.exp(lwi_values)
+    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
     shift_vec = mean_weighted - mean_original
 
     cov_original = np.cov(upars_values, rowvar=False, ddof=1)
-    cov_weighted = np.cov(upars_values, rowvar=False, aweights=weights, ddof=0)
+
+    weights_norm = weights_unnorm / np.sum(weights_unnorm)
+    cov_weighted = np.cov(upars_values, rowvar=False, aweights=weights_norm, ddof=0)
 
     mapping_mat = np.eye(upars_values.shape[1])
     try:
@@ -177,7 +162,7 @@ def _shift_and_cov(upars, lwi):
 
         chol_weighted = np.linalg.cholesky(cov_weighted)
         chol_original = np.linalg.cholesky(cov_original)
-        mapping_mat = chol_weighted @ np.linalg.inv(chol_original)
+        mapping_mat = chol_weighted.T @ np.linalg.inv(chol_original.T)
 
     except np.linalg.LinAlgError as e:
         warnings.warn(
@@ -192,15 +177,8 @@ def _shift_and_cov(upars, lwi):
     upars_new_values = upars_new_values @ mapping_mat.T
     upars_new_values = upars_new_values + mean_weighted[None, :]
 
-    upars_new_stacked = xr.DataArray(
-        upars_new_values,
-        dims=["__sample__", param_dim],
-        coords={
-            "__sample__": upars_stacked["__sample__"],
-            param_dim: upars_stacked[param_dim],
-        },
-    )
-    upars_new_da = upars_new_stacked.unstack("__sample__")
+    upars_new_da = _reconstruct_upars(upars_new_values, upars_props)
+
     return ShiftAndCovResult(upars=upars_new_da, shift=shift_vec, mapping=mapping_mat)
 
 
@@ -926,3 +904,28 @@ def _check_log_density(log_dens, name, log_likelihood, n_samples, sample_dims):
     else:
         raise TypeError(f"{name} must be a numpy ndarray or xarray DataArray")
     return validated_log_dens
+
+
+def _get_upars_info(upars, param_dim):
+    """Get original properties from upars DataArray."""
+    props = {
+        "dims": upars.dims,
+        "shape": upars.shape,
+        "coords": {
+            "chain": upars.coords["chain"],
+            "draw": upars.coords["draw"],
+        },
+    }
+    if param_dim in upars.coords:
+        props["coords"][param_dim] = upars.coords[param_dim]
+    return props
+
+
+def _reconstruct_upars(upars_new_values, props):
+    """Reconstruct upars DataArray from new values."""
+    upars_new_values_reshaped = upars_new_values.reshape(props["shape"])
+    return xr.DataArray(
+        upars_new_values_reshaped,
+        dims=props["dims"],
+        coords=props["coords"],
+    )
