@@ -80,8 +80,11 @@ def _shift(upars, lwi):
     lwi_values = lwi_stacked.transpose("__sample__").data
 
     mean_original = np.mean(upars_values, axis=0)
-    weights_unnorm = np.exp(lwi_values)
-    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
+    weights = np.exp(lwi_values)
+    weights_sum = np.sum(weights)
+    if weights_sum < 1e-9:
+        weights_sum = 1.0  # effectively no shift if weights are all zero
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0) / weights_sum
     shift_vec = mean_weighted - mean_original
     upars_new_values = upars_values + shift_vec[None, :]
 
@@ -102,21 +105,26 @@ def _shift_and_scale(upars, lwi):
     upars_values = upars_stacked.transpose("__sample__", param_dim).data
     lwi_values = lwi_stacked.transpose("__sample__").data
 
-    n_samples = upars_values.shape[0]
-
     mean_original = np.mean(upars_values, axis=0)
-    weights_unnorm = np.exp(lwi_values)
-    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
+    weights = np.exp(lwi_values)
+    weights_sum = np.sum(weights)
+    if weights_sum < 1e-9:
+        weights_sum = 1.0
+
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0) / weights_sum
     shift_vec = mean_weighted - mean_original
 
-    mii = np.sum(weights_unnorm[:, None] * upars_values**2, axis=0) - mean_weighted**2
-    mii = mii * n_samples / (n_samples - 1)
+    # weighted variance, biased
+    var_weighted = (
+        np.sum(weights[:, None] * (upars_values - mean_weighted[None, :]) ** 2, axis=0)
+        / weights_sum
+    )
 
     var_original = np.var(upars_values, axis=0, ddof=1)
 
     scaling_vec = np.ones_like(mean_original)
-    valid_mask = (var_original > 1e-9) & (mii > 1e-9)
-    scaling_vec[valid_mask] = np.sqrt(mii[valid_mask] / var_original[valid_mask])
+    valid_mask = (var_original > 1e-9) & (var_weighted > 1e-9)
+    scaling_vec[valid_mask] = np.sqrt(var_weighted[valid_mask] / var_original[valid_mask])
 
     upars_new_values = upars_values - mean_original[None, :]
     upars_new_values = upars_new_values * scaling_vec[None, :]
@@ -140,14 +148,13 @@ def _shift_and_cov(upars, lwi):
     lwi_values = lwi_stacked.transpose("__sample__").data
 
     mean_original = np.mean(upars_values, axis=0)
-    weights_unnorm = np.exp(lwi_values)
-    mean_weighted = np.sum(weights_unnorm[:, None] * upars_values, axis=0) / np.sum(weights_unnorm)
+    weights = np.exp(lwi_values)
+    weights_sum = np.sum(weights)
+    mean_weighted = np.sum(weights[:, None] * upars_values, axis=0) / weights_sum
     shift_vec = mean_weighted - mean_original
 
     cov_original = np.cov(upars_values, rowvar=False, ddof=1)
-
-    weights_norm = weights_unnorm / np.sum(weights_unnorm)
-    cov_weighted = np.cov(upars_values, rowvar=False, aweights=weights_norm, ddof=0)
+    cov_weighted = np.cov(upars_values, rowvar=False, aweights=weights, ddof=0)
 
     mapping_mat = np.eye(upars_values.shape[1])
     try:
@@ -218,7 +225,6 @@ def _recalculate_weights_k(
     ki_new = ki_new[0].item() if isinstance(ki_new, tuple) else ki_new.item()
 
     log_ratio_full = log_prob_new - orig_log_prob
-    log_ratio_full = xr.where(np.isnan(log_ratio_full), -np.inf, log_ratio_full)
 
     lwfi_new, kfi_new = log_ratio_full.azstats.psislw(r_eff=reff, dim=sample_dims)
     kfi_new = kfi_new[0].item() if isinstance(kfi_new, tuple) else kfi_new.item()
@@ -238,6 +244,7 @@ def _update_loo_data_i(
     obs_dims,
     n_samples,
     original_log_liki=None,
+    suppress_warnings=False,
 ):
     """Update the ELPDData object for a single observation."""
     if loo_data.elpd_i is None or loo_data.pareto_k is None:
@@ -264,7 +271,9 @@ def _update_loo_data_i(
     loo_data.se = np.sqrt(loo_data.n_data_points * np.nanvar(loo_data.elpd_i.values))
 
     loo_data.warning, loo_data.good_k = _warn_pareto_k(
-        loo_data.pareto_k.values[~np.isnan(loo_data.pareto_k.values)], loo_data.n_samples
+        loo_data.pareto_k.values[~np.isnan(loo_data.pareto_k.values)],
+        loo_data.n_samples,
+        suppress=suppress_warnings,
     )
 
 
@@ -843,19 +852,20 @@ def _select_obs_by_coords(data_array, coord_array, dims, dim_name):
     return data_array.sel({dims[0]: coord_array[dims[0]]})
 
 
-def _warn_pareto_k(pareto_k_values, n_samples):
+def _warn_pareto_k(pareto_k_values, n_samples, suppress=False):
     """Check Pareto k values and issue warnings if necessary."""
     good_k = min(1 - 1 / np.log10(n_samples), 0.7) if n_samples > 1 else 0.7
     warn_mg = False
 
     if np.any(pareto_k_values > good_k):
-        warnings.warn(
-            f"Estimated shape parameter of Pareto distribution is greater than {good_k:.2f} "
-            "for one or more samples. You should consider using a more robust model, this is "
-            "because importance sampling is less likely to work well if the marginal posterior "
-            "and LOO posterior are very different. This is more likely to happen with a "
-            "non-robust model and highly influential observations."
-        )
+        if not suppress:
+            warnings.warn(
+                f"Estimated shape parameter of Pareto distribution is greater than {good_k:.2f} "
+                "for one or more samples. You should consider using a more robust model, this is "
+                "because importance sampling is less likely to work well if the marginal posterior "
+                "and LOO posterior are very different. This is more likely to happen with a "
+                "non-robust model and highly influential observations."
+            )
         warn_mg = True
     return warn_mg, good_k
 
