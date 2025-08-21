@@ -282,7 +282,7 @@ def test_plpd_approx(centered_eight, log_lik_fn):
 
 
 def test_plpd_approx_errors(centered_eight):
-    with pytest.raises(TypeError, match="log_lik_fn must be a callable function"):
+    with pytest.raises(TypeError, match="log_lik_fun must be a callable function"):
         _plpd_approx(centered_eight, var_name="obs", log_lik_fn="not_callable")
 
     def invalid_fn():
@@ -293,10 +293,10 @@ def test_plpd_approx_errors(centered_eight):
             centered_eight, var_name="obs", log_lik_fn=invalid_fn, param_names=["missing_param"]
         )
 
-    def bad_return_fn():
-        return "not_numeric"
+    def bad_return_fn(data):
+        return np.full_like(data, "not_numeric")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises((RuntimeError, TypeError, ValueError)):
         _plpd_approx(
             centered_eight, var_name="obs", log_lik_fn=bad_return_fn, param_names=["theta"]
         )

@@ -1,7 +1,9 @@
 # pylint: disable=too-many-instance-attributes,too-many-arguments,too-many-public-methods
 """Base class for sampling wrappers."""
 
-from arviz_base import convert_to_datatree
+import numpy as np
+import xarray as xr
+from arviz_base import convert_to_datatree, extract
 from xarray import apply_ufunc
 
 
@@ -209,3 +211,277 @@ class SamplingWrapper:
             if instance_method == base_class_method:
                 not_implemented.append(method_name)
         return not_implemented
+
+
+class PLPDWrapper:
+    """Class wrapping the Point Log Predictive Density (PLPD) approximation.
+
+    Parameters
+    ----------
+    data : DataTree or InferenceData
+        Input data containing `posterior` and `observed_data` groups.
+    var_name : str
+        Name of the variable in `observed_data` for which to compute
+        the PLPD approximation.
+    log_lik_fun : callable
+        A function that computes the log-likelihood for a single observation given the
+        mean values of posterior parameters. Required only when ``method="plpd"``.
+        The function must accept the observed data value for a single point as its
+        first argument (scalar). Subsequent arguments must correspond to the mean
+        values of the posterior parameters specified by ``param_names``, passed in the
+        same order. It should return a single scalar log-likelihood value.
+    posterior_vars : list[str], optional
+        An ordered list of parameter names from the posterior group whose mean values
+        will be passed as positional arguments (after the data point value) to `log_lik_fn`.
+        If None, all parameters from the posterior group are used.
+    constant_data : dict, optional
+        Dictionary mapping parameter names to arrays of observation-specific constants.
+        These will be passed as additional arguments to log_lik_fun after the posterior
+        parameters. Arrays must have the same shape as the observed data or be broadcastable
+        to it.
+    log : bool, default True
+        Whether the ``log_lik_fun`` returns log-likelihood (True) or
+        likelihood (False). Default is True. If False, the output will be log-transformed.
+    log_lik_kwargs : dict, optional
+        Additional keyword arguments to pass to log_lik_fun.
+    apply_ufunc_kwargs : dict, optional
+        Additional keyword arguments to pass to xarray.apply_ufunc.
+    """
+
+    def __init__(
+        self,
+        data,
+        var_name,
+        log_lik_fun,
+        posterior_vars=None,
+        constant_data=None,
+        log=True,
+        log_lik_kwargs=None,
+        apply_ufunc_kwargs=None,
+    ):
+        self.data = convert_to_datatree(data)
+        self.var_name = var_name
+        self.log_lik_fun = log_lik_fun
+        self.posterior_vars = posterior_vars
+        self.constant_data = constant_data or {}
+        self.log = log
+        self.log_lik_kwargs = log_lik_kwargs or {}
+        self.apply_ufunc_kwargs = apply_ufunc_kwargs or {}
+
+        self._validate_inputs()
+        self.observed = self.data.observed_data[self.var_name]
+        self.posterior_mean_arrays = self._get_posterior_mean_arrays()
+        self.constant_data_arrays = self._prepare_constant_data()
+
+    def _validate_inputs(self):
+        """Validate input parameters."""
+        if not callable(self.log_lik_fun):
+            raise TypeError("log_lik_fun must be a callable function.")
+
+        if not hasattr(self.data, "observed_data"):
+            raise ValueError("No observed_data group found in the data")
+
+        if self.var_name not in self.data.observed_data:
+            raise ValueError(f"Variable {self.var_name} not found in observed_data")
+
+        if not hasattr(self.data, "posterior"):
+            raise ValueError("No posterior group found in the data")
+
+    def _get_posterior_mean_arrays(self):
+        """Get posterior parameters at their mean values as DataArrays."""
+        posterior = extract(self.data, group="posterior", combined=False)
+
+        if self.posterior_vars is None:
+            var_keys = sorted(list(posterior.data_vars.keys()))
+        else:
+            missing_params = [p for p in self.posterior_vars if p not in posterior.data_vars]
+            if missing_params:
+                raise ValueError(f"Parameters {missing_params} not found in posterior group.")
+            var_keys = self.posterior_vars
+
+        param_mean_arrays = []
+        for key in var_keys:
+            param_data = posterior[key]
+            param_mean = param_data.mean(dim=["chain", "draw"])
+            param_mean_arrays.append(param_mean)
+
+        return param_mean_arrays
+
+    def _prepare_constant_data(self):
+        """Prepare constant data arrays to match observation dimensions."""
+        constant_arrays = []
+        obs_dims = self.observed.dims
+        obs_coords = self.observed.coords
+
+        for _, values in self.constant_data.items():
+            if not isinstance(values, xr.DataArray):
+                values_array = np.asarray(values)
+                if values_array.shape == self.observed.shape:
+                    da = xr.DataArray(values_array, dims=obs_dims, coords=obs_coords)
+                elif values_array.ndim == 1 and len(obs_dims) == 1:
+                    da = xr.DataArray(values_array, dims=obs_dims, coords=obs_coords)
+                else:
+                    da = xr.DataArray(values_array)
+            else:
+                da = values
+            constant_arrays.append(da)
+
+        return constant_arrays
+
+    def compute(self):
+        """Compute the PLPD approximation.
+
+        Returns
+        -------
+        DataArray
+            DataArray containing PLPD values with the same dimensions
+            as observed data, named 'plpd'.
+        """
+        if not self.log:
+
+            def wrapped_func(obs, *params):
+                result = self.log_lik_fun(obs, *params, **self.log_lik_kwargs)
+                return np.log(np.maximum(result, np.finfo(float).tiny))
+        else:
+
+            def wrapped_func(obs, *params):
+                return self.log_lik_fun(obs, *params, **self.log_lik_kwargs)
+
+        all_params = self.posterior_mean_arrays + self.constant_data_arrays
+
+        plpd_values = apply_ufunc(
+            wrapped_func,
+            self.observed,
+            *all_params,
+            **self.apply_ufunc_kwargs,
+        )
+
+        plpd_values.name = "plpd"
+        return plpd_values
+
+    def compute_log_likelihood(self):
+        """Compute log-likelihood values across all posterior samples.
+
+        Returns
+        -------
+        DataArray
+            DataArray with shape (chain, draw, *obs_dims) containing
+            log-likelihood values for all posterior samples.
+        """
+        posterior = extract(self.data, group="posterior", combined=True)
+        var_keys = (
+            self.posterior_vars if self.posterior_vars else sorted(list(posterior.data_vars.keys()))
+        )
+
+        obs_dims = list(self.observed.dims)
+        n_samples = posterior.sizes["sample"]
+
+        if not self.log:
+
+            def wrapped_func(obs, *params):
+                result = self.log_lik_fun(obs, *params, **self.log_lik_kwargs)
+                return np.log(np.maximum(result, np.finfo(float).tiny))
+        else:
+
+            def wrapped_func(obs, *params):
+                return self.log_lik_fun(obs, *params, **self.log_lik_kwargs)
+
+        ll_shape = (n_samples, *self.observed.shape)
+        log_likelihood = np.zeros(ll_shape)
+
+        for i in range(n_samples):
+            param_vals = [posterior[key].isel(sample=i) for key in var_keys]
+            all_params = param_vals + self.constant_data_arrays
+
+            ll_values = apply_ufunc(
+                wrapped_func, self.observed, *all_params, **self.apply_ufunc_kwargs
+            )
+            log_likelihood[i] = ll_values.values
+
+        posterior_original = extract(self.data, group="posterior", combined=False)
+        n_chains = posterior_original.sizes["chain"]
+        n_draws = posterior_original.sizes["draw"]
+
+        ll_reshaped = log_likelihood.reshape((n_chains, n_draws, *self.observed.shape))
+
+        coords = {
+            "chain": posterior_original.coords["chain"],
+            "draw": posterior_original.coords["draw"],
+            **{dim: self.observed.coords[dim] for dim in obs_dims},
+        }
+
+        return xr.DataArray(
+            ll_reshaped, dims=["chain", "draw", *obs_dims], coords=coords, name="log_lik"
+        )
+
+    def __repr__(self):
+        """Representation of PLPDWrapper."""
+        var_names = self.posterior_vars or sorted(
+            list(extract(self.data, group="posterior", combined=False).data_vars.keys())
+        )
+        vars_str = ", ".join(var_names)
+        return (
+            f"PLPDWrapper(var_name='{self.var_name}', "
+            f"posterior_vars=[{vars_str}], "
+            f"log={self.log})"
+        )
+
+
+def compute_plpd(
+    data,
+    var_name,
+    log_lik_fun,
+    posterior_vars=None,
+    constant_data=None,
+    log=True,
+    log_lik_kwargs=None,
+    **apply_ufunc_kwargs,
+):
+    """Compute PLPD approximation.
+
+    Parameters
+    ----------
+    data : DataTree or InferenceData
+        Input data containing `posterior` and `observed_data` groups.
+    var_name : str
+        Name of the variable in `observed_data` for which to compute
+        the PLPD approximation.
+    log_lik_fun : callable
+        A function that computes the log-likelihood for a single observation given the
+        mean values of posterior parameters. Required only when ``method="plpd"``.
+        The function must accept the observed data value for a single point as its
+        first argument (scalar). Subsequent arguments must correspond to the mean
+        values of the posterior parameters specified by ``param_names``, passed in the
+        same order. It should return a single scalar log-likelihood value.
+    posterior_vars : list[str], optional
+        An ordered list of parameter names from the posterior group whose mean values
+        will be passed as positional arguments (after the data point value) to `log_lik_fn`.
+        If None, all parameters from the posterior group are used in alphabetical order.
+    constant_data : dict, optional
+        Dictionary mapping parameter names to arrays of observation-specific constants.
+        These will be passed as additional arguments to log_lik_fun after the posterior
+        parameters. Arrays must have the same shape as the observed data or be broadcastable
+        to it.
+    log : bool, default True
+        Whether log_lik_fun returns log-likelihood (True) or likelihood (False).
+    log_lik_kwargs : dict, optional
+        Additional keyword arguments to pass to log_lik_fun.
+    **apply_ufunc_kwargs
+        Additional keyword arguments passed to xarray.apply_ufunc.
+
+    Returns
+    -------
+    DataArray
+        DataArray containing PLPD values with the same dimensions as observed data.
+    """
+    wrapper = PLPDWrapper(
+        data=data,
+        var_name=var_name,
+        log_lik_fun=log_lik_fun,
+        posterior_vars=posterior_vars,
+        constant_data=constant_data,
+        log=log,
+        log_lik_kwargs=log_lik_kwargs,
+        apply_ufunc_kwargs=apply_ufunc_kwargs,
+    )
+    return wrapper.compute()

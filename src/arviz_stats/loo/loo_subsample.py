@@ -11,11 +11,12 @@ from arviz_stats.loo.helper_loo import (
     _get_r_eff,
     _prepare_full_arrays,
     _prepare_loo_inputs,
+    _prepare_loo_inputs_for_plpd,
     _prepare_subsample,
     _prepare_update_subsample,
     _select_obs_by_coords,
-    _select_obs_by_indices,
     _srs_estimator,
+    _subsample_with_log_weights,
     _warn_pareto_k,
 )
 from arviz_stats.loo.loo_approximate_posterior import loo_approximate_posterior
@@ -37,6 +38,7 @@ def loo_subsample(
     log_lik_fn=None,
     param_names=None,
     log=True,
+    constant_data=None,
 ):
     """Compute PSIS-LOO-CV using sub-sampling.
 
@@ -106,6 +108,11 @@ def loo_subsample(
     log: bool, optional
         Only used when ``method="plpd"``. Whether the ``log_lik_fn`` returns
         log-likelihood (True) or likelihood (False). Default is True.
+    constant_data : dict, optional
+        Only used when ``method="plpd"``. Dictionary mapping parameter names to arrays
+        of observation-specific constants. These will be passed as additional arguments
+        to log_lik_fn after the posterior parameters. Arrays must have the same shape
+        as the observed data.
 
     Returns
     -------
@@ -133,6 +140,16 @@ def loo_subsample(
         - **thin**: Thinning factor for posterior draws.
         - **log_weights**: Smoothed log weights.
 
+    Notes
+    -----
+    The PLPD (Point Log Predictive Density) approximation method is useful when you don't have
+    pre-computed log-likelihood values in your InferenceData or when working with very large
+    datasets where memory efficiency is critical. Unlike the standard LPD method which requires
+    log-likelihood values for all observations across all posterior samples, PLPD computes
+    log-likelihood on-the-fly only for the subsample using posterior mean parameters. This trades
+    a small amount of accuracy for significant memory savings and computational flexibility.
+    For more details, see [3]_.
+
     Examples
     --------
     Calculate sub-sampled PSIS-LOO-CV using 4 random observations:
@@ -151,23 +168,25 @@ def loo_subsample(
 
         In [2]: loo_results.elpd_i
 
-    We can also use the PLPD approximation method with a custom log-likelihood function.
-    We need to define a function that computes the log-likelihood for a single observation
-    given the mean values of posterior parameters. For the Eight Schools model, we define a
-    function that computes the likelihood for each observation using the *global mean* of the
-    parameters (e.g., the overall mean `theta`):
+    We can also use the PLPD (Point Log Predictive Density) approximation method. This is
+    particularly useful when you want to approximate the LOO-CV using the posterior mean
+    parameters. The PLPD method requires a log-likelihood function that accepts observed
+    data and posterior parameters. For hierarchical models with observation-specific
+    parameters, you can use the ``constant_data`` argument:
 
     .. ipython::
+        :okwarning:
 
         In [1]: import numpy as np
            ...: from arviz_stats import loo_subsample
            ...: from arviz_base import load_arviz_data
-           ...: from scipy.stats import norm
-           ...: data = load_arviz_data("centered_eight")
+           ...: from scipy import stats
            ...:
-           ...: def log_lik_fn(y, theta):
-           ...:     sigma = 12.5  # Using a fixed sigma for simplicity
-           ...:     return norm.logpdf(y, loc=theta, scale=sigma)
+           ...: data = load_arviz_data("centered_eight")
+           ...: sigma_y = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+           ...:
+           ...: def log_lik_fn(y, theta, sigma):
+           ...:     return stats.norm.logpdf(y, loc=theta, scale=sigma)
            ...:
            ...: loo_results = loo_subsample(
            ...:     data,
@@ -176,6 +195,7 @@ def loo_subsample(
            ...:     method="plpd",
            ...:     log_lik_fn=log_lik_fn,
            ...:     param_names=["theta"],
+           ...:     constant_data={"sigma": sigma_y},
            ...:     pointwise=True
            ...: )
            ...: loo_results
@@ -204,13 +224,17 @@ def loo_subsample(
         https://proceedings.mlr.press/v97/magnusson19a.html
         arXiv preprint https://arxiv.org/abs/1904.10679
     """
-    loo_inputs = _prepare_loo_inputs(data, var_name, thin)
-    pointwise = rcParams["stats.ic_pointwise"] if pointwise is None else pointwise
-
     if method not in ["lpd", "plpd"]:
         raise ValueError("Method must be either 'lpd' or 'plpd'")
     if method == "plpd" and log_lik_fn is None:
         raise ValueError("log_lik_fn must be provided when method='plpd'")
+
+    if method == "plpd":
+        loo_inputs = _prepare_loo_inputs_for_plpd(data, var_name)
+    else:
+        loo_inputs = _prepare_loo_inputs(data, var_name, thin)
+
+    pointwise = rcParams["stats.ic_pointwise"] if pointwise is None else pointwise
 
     log_likelihood = loo_inputs.log_likelihood
     if reff is None:
@@ -230,6 +254,7 @@ def loo_subsample(
         loo_inputs.sample_dims,
         loo_inputs.n_data_points,
         loo_inputs.n_samples,
+        constant_data,
     )
 
     sample_ds = xr.Dataset({loo_inputs.var_name: subsample_data.log_likelihood_sample})
@@ -257,30 +282,23 @@ def loo_subsample(
                 if loo_inputs.var_name in log_weights:
                     log_weights = log_weights[loo_inputs.var_name]
 
-            if len(loo_inputs.obs_dims) > 1:
-                stacked_obs_dim = "__obs__"
-                log_weights_stacked = log_weights.stack({stacked_obs_dim: loo_inputs.obs_dims})
-                log_weights_sample = _select_obs_by_indices(
-                    log_weights_stacked, subsample_data.indices, [stacked_obs_dim], stacked_obs_dim
-                )
-                log_weights_sample = log_weights_sample.unstack(stacked_obs_dim)
-            else:
-                obs_dim = loo_inputs.obs_dims[0]
-                log_weights_sample = _select_obs_by_indices(
-                    log_weights, subsample_data.indices, loo_inputs.obs_dims, obs_dim
-                )
+            log_weights_sample = _subsample_with_log_weights(
+                log_weights, subsample_data.indices, loo_inputs.obs_dims
+            )
 
-            log_weights_sample_ds = xr.Dataset({loo_inputs.var_name: log_weights_sample})
+            combined_ds = sample_ds.copy()
+            combined_ds[loo_inputs.var_name] = log_weights_sample + sample_ds[loo_inputs.var_name]
 
-            _, pareto_k_ds = sample_ds.azstats.psislw(r_eff=reff, dim=loo_inputs.sample_dims)
-
-            log_weights_ds = log_weights_sample_ds + sample_ds
+            _, pareto_k_ds = combined_ds.azstats.psislw(r_eff=reff, dim=loo_inputs.sample_dims)
+            log_weights_ds = combined_ds
         else:
             log_weights_ds, pareto_k_ds = sample_ds.azstats.psislw(
                 r_eff=reff, dim=loo_inputs.sample_dims
             )
             log_weights_sample = log_weights_ds[loo_inputs.var_name]
-            log_weights_ds += sample_ds
+            log_weights_ds[loo_inputs.var_name] = (
+                log_weights_ds[loo_inputs.var_name] + sample_ds[loo_inputs.var_name]
+            )
 
         elpd_loo_i = logsumexp(log_weights_ds, dims=loo_inputs.sample_dims)[loo_inputs.var_name]
         pareto_k_sample_da = pareto_k_ds[loo_inputs.var_name]
@@ -376,6 +394,7 @@ def update_subsample(
     log_lik_fn=None,
     param_names=None,
     log=True,
+    constant_data=None,
 ):
     """Update a sub-sampled PSIS-LOO-CV object with new observations.
 
@@ -431,6 +450,11 @@ def update_subsample(
     log: bool, optional
         Only used when ``method="plpd"``. Whether the ``log_lik_fn`` returns
         log-likelihood (True) or likelihood (False). Default is True.
+    constant_data : dict, optional
+        Only used when ``method="plpd"``. Dictionary mapping parameter names to arrays
+        of observation-specific constants. These will be passed as additional arguments
+        to log_lik_fn after the posterior parameters. Arrays must have the same shape
+        as the observed data.
 
     Returns
     -------
@@ -499,20 +523,27 @@ def update_subsample(
     thin = getattr(loo_orig, "thin_factor", None)
     loo_inputs = _prepare_loo_inputs(data, var_name, thin)
     update_data = _prepare_update_subsample(
-        loo_orig, data, observations, var_name, seed, method, log_lik_fn, param_names, log
+        loo_orig,
+        data,
+        observations,
+        var_name,
+        seed,
+        method,
+        log_lik_fn,
+        param_names,
+        log,
+        constant_data,
     )
 
     if reff is None:
         reff = _get_r_eff(data, loo_inputs.n_samples)
 
-    # Get log densities from original ELPD data if they exist
     log_p = getattr(loo_orig, "log_p", None)
     log_q = getattr(loo_orig, "log_q", None)
 
     log_weights_new = None
-    if log_weights is None:
-        log_weights = getattr(loo_orig, "log_weights", None)
-
+    # We can't use log_weights from loo_orig as they are already subsampled
+    # and don't have values for the new indices
     if log_weights is not None:
         if isinstance(log_weights, ELPDData):
             if log_weights.log_weights is None:
@@ -521,17 +552,13 @@ def update_subsample(
             if loo_inputs.var_name in log_weights:
                 log_weights = log_weights[loo_inputs.var_name]
 
-        if len(loo_inputs.obs_dims) > 1:
-            stacked_obs_dim = "__obs__"
-            log_weights_stacked = log_weights.stack({stacked_obs_dim: loo_inputs.obs_dims})
-            log_weights_new = _select_obs_by_indices(
-                log_weights_stacked, update_data.new_indices, [stacked_obs_dim], stacked_obs_dim
-            )
-            log_weights_new = log_weights_new.unstack(stacked_obs_dim)
+        for dim in loo_inputs.obs_dims:
+            if log_weights.sizes[dim] != loo_inputs.log_likelihood.sizes[dim]:
+                log_weights_new = None
+                break
         else:
-            obs_dim = loo_inputs.obs_dims[0]
-            log_weights_new = _select_obs_by_indices(
-                log_weights, update_data.new_indices, loo_inputs.obs_dims, obs_dim
+            log_weights_new = _subsample_with_log_weights(
+                log_weights, update_data.new_indices, loo_inputs.obs_dims
             )
 
     if log_weights_new is None:

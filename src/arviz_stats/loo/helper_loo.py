@@ -2,13 +2,13 @@
 
 import warnings
 from collections import namedtuple
-from numbers import Number
 
 import numpy as np
 import xarray as xr
 from arviz_base import convert_to_datatree, extract, rcParams
 from xarray_einstats.stats import logsumexp
 
+from arviz_stats.loo.wrapper import PLPDWrapper
 from arviz_stats.utils import ELPDData, get_log_likelihood
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "_generate_subsample_indices",
     "_get_r_eff",
     "_prepare_loo_inputs",
+    "_prepare_loo_inputs_for_plpd",
     "_extract_loo_data",
     "_check_log_density",
     "_check_log_jacobian",
@@ -34,6 +35,7 @@ __all__ = [
     "_select_obs_by_indices",
     "_select_obs_by_coords",
     "_prepare_full_arrays",
+    "_subsample_with_log_weights",
 ]
 
 LooInputs = namedtuple(
@@ -229,6 +231,7 @@ def _plpd_approx(
     log_lik_fn,
     param_names=None,
     log=True,
+    constant_data=None,
 ):
     """Compute the Point Log Predictive Density (PLPD) approximation.
 
@@ -258,55 +261,15 @@ def _plpd_approx(
     DataArray
         DataArray containing PLPD values with the same dimensions as observed data.
     """
-    if not callable(log_lik_fn):
-        raise TypeError("log_lik_fn must be a callable function.")
-    if not hasattr(data, "observed_data"):
-        raise ValueError("No observed_data group found in the data")
-    if var_name not in data.observed_data:
-        raise ValueError(f"Variable {var_name} not found in observed_data")
-
-    observed = data.observed_data[var_name]
-    posterior = extract(data, group="posterior", combined=True)
-
-    if param_names is None:
-        param_keys = sorted(list(posterior.data_vars.keys()))
-    else:
-        missing_params = [p for p in param_names if p not in posterior.data_vars]
-        if missing_params:
-            raise ValueError(f"Parameters {missing_params} not found in posterior group.")
-        param_keys = param_names
-
-    param_means = [float(posterior[key].mean()) for key in param_keys]
-    plpd_values = np.empty_like(observed.values, dtype=float)
-
-    for idx, value in np.ndenumerate(observed.values):
-        try:
-            result = log_lik_fn(value, *param_means)
-            if not log:
-                result = np.log(np.maximum(result, np.finfo(float).tiny))
-
-            if not isinstance(result, Number):
-                raise TypeError(
-                    f"log_lik_fn must return a numeric scalar. Got type: {type(result)}"
-                )
-            plpd_values[idx] = result
-        except Exception as e:
-            coord_info = ", ".join(
-                [f"{dim}: {observed[idx].coords[dim].values.item()}" for dim in observed.coords]
-            )
-            raise RuntimeError(
-                f"Error computing log-likelihood with log_lik_fn for data point "
-                f"with coordinates ({coord_info}) "
-                f"at index {idx} (value: {value}): {e}"
-            ) from e
-
-    plpd_da = xr.DataArray(
-        plpd_values,
-        dims=observed.dims,
-        coords=observed.coords,
-        name="plpd",
+    wrapper = PLPDWrapper(
+        data=data,
+        var_name=var_name,
+        log_lik_fun=log_lik_fn,
+        posterior_vars=param_names,
+        log=log,
+        constant_data=constant_data,
     )
-    return plpd_da
+    return wrapper.compute()
 
 
 def _diff_srs_estimator(
@@ -588,6 +551,40 @@ def _get_r_eff(data, n_samples):
     return reff
 
 
+def _prepare_loo_inputs_for_plpd(data, var_name):
+    """Prepare inputs for PSIS-LOO-CV with PLPD approximation."""
+    data = convert_to_datatree(data)
+
+    if not hasattr(data, "observed_data"):
+        raise ValueError("No observed_data group found in the data")
+
+    if var_name not in data.observed_data:
+        raise ValueError(f"Variable {var_name} not found in observed_data")
+
+    observed_da = data.observed_data[var_name]
+
+    posterior = extract(data, group="posterior", combined=False)
+    sample_dims = ["chain", "draw"]
+    n_samples = posterior.sizes["chain"] * posterior.sizes["draw"]
+
+    obs_dims = list(observed_da.dims)
+    n_data_points = np.prod(list(observed_da.shape))
+
+    placeholder = xr.DataArray(
+        np.zeros((posterior.sizes["chain"], posterior.sizes["draw"], *observed_da.shape)),
+        dims=["chain", "draw", *obs_dims],
+    )
+
+    return LooInputs(
+        placeholder,
+        var_name,
+        sample_dims,
+        obs_dims,
+        n_samples,
+        n_data_points,
+    )
+
+
 def _prepare_loo_inputs(data, var_name, thin_factor=None):
     """Prepare inputs for PSIS-LOO-CV."""
     data = convert_to_datatree(data)
@@ -632,6 +629,7 @@ def _prepare_subsample(
     sample_dims,
     n_data_points,
     n_samples,
+    constant_data=None,
 ):
     """Prepare inputs for PSIS-LOO-CV with sub-sampling."""
     indices, subsample_size = _generate_subsample_indices(n_data_points, observations, seed)
@@ -639,9 +637,17 @@ def _prepare_subsample(
     if method == "lpd":
         lpd_approx_all = logsumexp(log_likelihood_da, dims=sample_dims, b=1 / n_samples)
     else:  # method == "plpd"
-        lpd_approx_all = _plpd_approx(
-            data=data, var_name=var_name, log_lik_fn=log_lik_fn, param_names=param_names, log=log
+        wrapper = PLPDWrapper(
+            data=data,
+            var_name=var_name,
+            log_lik_fun=log_lik_fn,
+            posterior_vars=param_names,
+            log=log,
+            constant_data=constant_data,
         )
+
+        lpd_approx_all = wrapper.compute()
+        log_likelihood_da = wrapper.compute_log_likelihood()
 
     stacked_obs_dim = "__obs__"
     if len(obs_dims) > 1:
@@ -680,6 +686,7 @@ def _prepare_update_subsample(
     log_lik_fn,
     param_names,
     log,
+    constant_data=None,
 ):
     """Prepare inputs for updating PSIS-LOO-CV with additional observations."""
     loo_inputs = _prepare_loo_inputs(data, var_name)
@@ -719,6 +726,7 @@ def _prepare_update_subsample(
             log_lik_fn,
             param_names,
             log,
+            constant_data,
         )
 
     log_likelihood_new_da = _select_obs_by_indices(
@@ -824,6 +832,27 @@ def _select_obs_by_indices(data_array, indices, dims, dim_name):
 
     dim = dim_name if len(dims) > 1 else dims[0]
     return stacked_data.isel({dim: valid_indices})
+
+
+def _subsample_with_log_weights(log_weights, indices, obs_dims, var_name=None):
+    """Subsample log_weights based on indices."""
+    if log_weights is None:
+        return None
+
+    if isinstance(log_weights, xr.Dataset):
+        if var_name is None:
+            raise ValueError("var_name must be specified when log_weights is a Dataset")
+        if var_name not in log_weights:
+            return None
+        log_weights = log_weights[var_name]
+
+    if len(obs_dims) == 1:
+        return log_weights.isel({obs_dims[0]: indices})
+
+    stacked_obs_dim = "__obs__"
+    log_weights_stacked = log_weights.stack({stacked_obs_dim: obs_dims})
+    log_weights_sample = log_weights_stacked.isel({stacked_obs_dim: indices})
+    return log_weights_sample.unstack(stacked_obs_dim)
 
 
 def _select_obs_by_coords(data_array, coord_array, dims, dim_name):
